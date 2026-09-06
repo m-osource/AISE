@@ -296,10 +296,10 @@ The `map_ip_trespass` map is populated and processed exclusively by the **User-S
 Session memory cleanup and life-cycle management on BoxA are governed by a decoupled three-tiered protection mechanism[span_97](start_span)[span_97](end_span):
 
 1. **Active Teardown via Internal UDP (L7 Penalty and Contextual Flush):** 
-   When the AI Secure Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($T_{infraction}$)[span_98](start_span)[span_98](end_span). The XDP program intercepts the message and performs an atomic cleanup[span_99](start_span)[span_99](end_span):
-   * Concurrently purges the entry from `map_session`, `map_unauth`, and `map_handshake`[span_100](start_span)[span_100](end_span).
-   * Populates the penalty in `map_blacklist` by calculating the future expiration timestamp (`until_when_ns`)[span_101](start_span)[span_101](end_span).
-   * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack[span_102](start_span)[span_102](end_span).
+   When the AI Secure Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($T_{infraction}$). The XDP program intercepts the message and performs an atomic cleanup:
+   * Concurrently purges the entry from `map_session`, `map_unauth`, and `map_handshake`.
+   * Populates the penalty in `map_blacklist` by calculating the future expiration timestamp (`until_when_ns`).
+   * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
 
 2. **In-Kernel TCP Teardown & State-Machine (`SESSION_CLOSING`):** 
    In compliance with RFC 793/9293, authenticated session closures are handled in real time directly on the XDP Fast-Path:
