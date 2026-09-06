@@ -302,23 +302,23 @@ Session memory cleanup and life-cycle management on BoxA are governed by a decou
    * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack[span_102](start_span)[span_102](end_span).
 
 2. **In-Kernel TCP Teardown & State-Machine (`SESSION_CLOSING`):** 
-   In compliance with RFC 793/9293, authenticated session closures are handled in real time directly on the XDP Fast-Path[span_103](start_span)[span_103](end_span):
-   * **Direct Forwarding (`RST`):** Incoming `RST` packets trigger immediate forwarding (`XDP_REDIRECT`) and instantaneous atomic deletion of the session from the BPF map (`bpf_map_delete_elem`)[span_104](start_span)[span_104](end_span).
-   * **Phased `FIN` Closure:** Upon encountering the first `FIN` packet, the session state transitions to `SESSION_CLOSING`[span_105](start_span)[span_105](end_span). Once the matching `FIN` from the opposite direction and the final confirming ACK pass through, XDP instantly purges the session from `map_session` and its corresponding entry in `map_blacklist` (if set with `until_when_ns == 0`), eliminating LAN UDP messaging overhead entirely[span_106](start_span)[span_106](end_span).
+   In compliance with RFC 793/9293, authenticated session closures are handled in real time directly on the XDP Fast-Path:
+   * **Direct Forwarding (`RST`):** Incoming `RST` packets trigger immediate forwarding (`XDP_REDIRECT`) and instantaneous atomic deletion of the session from the BPF map (`bpf_map_delete_elem`).
+   * **Phased `FIN` Closure:** Upon encountering the first `FIN` packet, the session state transitions to `SESSION_CLOSING`. Once the matching `FIN` from the opposite direction and the final confirming ACK pass through, XDP instantly purges the session from `map_session` and its corresponding entry in `map_blacklist` (if set with `until_when_ns == 0`), eliminating LAN UDP messaging overhead entirely.
 
 3. **User-Space Garbage Collector (Linux Daemon on BoxA):** 
-   A User-Space daemon periodically scans and inspects the eBPF maps via the `bpf()` syscall as a failsafe mechanism to handle abnormal disconnects and timeouts[span_107](start_span)[span_107](end_span):
-   * **In `map_handshake`:** Removes pending sessions whose creation time exceeds the completion TTL (3-5 seconds)[span_108](start_span)[span_108](end_span).
-   * **In `map_unauth`:** Purges pending authentication records whose creation timestamp exceeds the predefined threshold (60-120 seconds)[span_109](start_span)[span_109](end_span).
-   * **In `map_session` (Incomplete Teardowns / RFC Fallback):** Intervenes if a `FIN` teardown remains stuck in `SESSION_CLOSING` without receiving the final ACK (e.g., due to network packet loss), cleaning up the session and its blacklist entry upon expiration of a reduced *Grace-Timeout* (2-5 seconds)[span_110](start_span)[span_110](end_span). It also purges orphaned sessions exceeding the idle Hard Timeout based on `last_seen_ns`[span_111](start_span)[span_111](end_span).
-   * **In `map_blacklist`:** Removes temporary bans whose `until_when_ns` timestamp has elapsed[span_112](start_span)[span_112](end_span).
-   * **In `map_ip_trespass`:** Cleans up host entries whose cumulative suspension has expired or resets internal recidivism counters for rehabilitated hosts[span_113](start_span)[span_113](end_span).
+   A User-Space daemon periodically scans and inspects the eBPF maps via the `bpf()` syscall as a failsafe mechanism to handle abnormal disconnects and timeouts:
+   * **In `map_handshake`:** Removes pending sessions whose creation time exceeds the completion TTL (3-5 seconds).
+   * **In `map_unauth`:** Purges pending authentication records whose creation timestamp exceeds the predefined threshold (60-120 seconds).
+   * **In `map_session` (Incomplete Teardowns / RFC Fallback):** Intervenes if a `FIN` teardown remains stuck in `SESSION_CLOSING` without receiving the final ACK (e.g., due to network packet loss), cleaning up the session and its blacklist entry upon expiration of a reduced *Grace-Timeout* (2-5 seconds). It also purges orphaned sessions exceeding the idle Hard Timeout based on `last_seen_ns`.
+   * **In `map_blacklist`:** Removes temporary bans whose `until_when_ns` timestamp has elapsed.
+   * **In `map_ip_trespass`:** Cleans up host entries whose cumulative suspension has expired or resets internal recidivism counters for rehabilitated hosts.
 
 ---
 
 ## Appendix A: Scalable Architecture for Target Linux Environments (eBPF/XDP & NUMA)
 
-While OpenBSD serves as the primary deployment target for native isolation via `pledge`/`unveil`, the alternative variant for Linux environments is designed to maximize throughput on high-density multi-socket systems by leveraging NUMA separation between packet handling and AI inference[span_114](start_span)[span_114](end_span).
+While OpenBSD serves as the primary deployment target for native isolation via `pledge`/`unveil`, the alternative variant for Linux environments is designed to maximize throughput on high-density multi-socket systems by leveraging NUMA separation between packet handling and AI inference.
 
 ```mermaid
 flowchart TD
