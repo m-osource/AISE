@@ -44,7 +44,7 @@ Upon receiving the SYN-ACK packet issued by OpenBSD (BoxB) to the client:
 * **Handshake Initialization:** XDP creates a record in the LRU map `map_handshake_v4 / v6` recording:
   * **Expected Sequence Number:** $Seq_{SYN-ACK} + 1$
   * **TCP Initial Window Size:** Window size declared by OpenBSD.
-  * **Creation Timestamp (`created_at_ns`):** Generated via `bpf_ktime_get_ns()` to calculate the handshake timeout (e.g. 3â€“5 seconds).
+  * **Creation Timestamp (`created_at_ns`):** Generated via `bpf_ktime_get_ns()` to calculate the handshake timeout (e.g. 3-5 seconds).
 * **Pending Handshake Counter Increment:** XDP atomically increments (`__sync_fetch_and_add`) the `pending_handshake_count` value and updates `last_syn_ack_ns` in the `map_pending_handshake_v4 / v6` map for the client IP, triggering dynamic throttling for subsequent SYNs from the same IP.
 
 ---
@@ -301,9 +301,9 @@ Session memory cleanup and life-cycle management on BoxA are governed by a decou
 
 3. **User-Space Garbage Collector (Linux Daemon on BoxA):** 
    A User-Space daemon periodically scans and inspects the eBPF maps via the `bpf()` syscall as a failsafe mechanism to handle abnormal disconnects and timeouts[span_107](start_span)[span_107](end_span):
-   * **In `map_handshake`:** Removes pending sessions whose creation time exceeds the completion TTL (3â€“5 seconds)[span_108](start_span)[span_108](end_span).
-   * **In `map_unauth`:** Purges pending authentication records whose creation timestamp exceeds the predefined threshold (60â€“120 seconds)[span_109](start_span)[span_109](end_span).
-   * **In `map_session` (Incomplete Teardowns / RFC Fallback):** Intervenes if a `FIN` teardown remains stuck in `SESSION_CLOSING` without receiving the final ACK (e.g., due to network packet loss), cleaning up the session and its blacklist entry upon expiration of a reduced *Grace-Timeout* (2â€“5 seconds)[span_110](start_span)[span_110](end_span). It also purges orphaned sessions exceeding the idle Hard Timeout based on `last_seen_ns`[span_111](start_span)[span_111](end_span).
+   * **In `map_handshake`:** Removes pending sessions whose creation time exceeds the completion TTL (3-5 seconds)[span_108](start_span)[span_108](end_span).
+   * **In `map_unauth`:** Purges pending authentication records whose creation timestamp exceeds the predefined threshold (60-120 seconds)[span_109](start_span)[span_109](end_span).
+   * **In `map_session` (Incomplete Teardowns / RFC Fallback):** Intervenes if a `FIN` teardown remains stuck in `SESSION_CLOSING` without receiving the final ACK (e.g., due to network packet loss), cleaning up the session and its blacklist entry upon expiration of a reduced *Grace-Timeout* (2-5 seconds)[span_110](start_span)[span_110](end_span). It also purges orphaned sessions exceeding the idle Hard Timeout based on `last_seen_ns`[span_111](start_span)[span_111](end_span).
    * **In `map_blacklist`:** Removes temporary bans whose `until_when_ns` timestamp has elapsed[span_112](start_span)[span_112](end_span).
    * **In `map_ip_trespass`:** Cleans up host entries whose cumulative suspension has expired or resets internal recidivism counters for rehabilitated hosts[span_113](start_span)[span_113](end_span).
 
@@ -313,12 +313,19 @@ Session memory cleanup and life-cycle management on BoxA are governed by a decou
 
 While OpenBSD serves as the primary deployment target for native isolation via `pledge`/`unveil`, the alternative variant for Linux environments is designed to maximize throughput on high-density multi-socket systems by leveraging NUMA separation between packet handling and AI inference[span_114](start_span)[span_114](end_span).
 
-```text
-[ NUMA NODE 0: Network & Fast-Path ]    â”‚    [ NUMA NODE 1: Compute & AI Engine ]
-â”‚
-[ NIC PCIe ] â”€â”€> [ XDP / eBPF Driver ]  â”‚  [ Gatekeeper Process ]  [ AI Inferer Engine ]
-â”‚                â”‚           â”‚                     â”‚
-â””â”€â”€â”€â”€â”€â”€â”€â”€â”€( RingBuffer / BPF Maps )â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```mermaid
+flowchart TD
+    subgraph NUMA_0["NUMA NODE 0: Network & Fast-Path"]
+        NIC["NIC PCIe"] --> XDP["XDP / eBPF Driver"]
+    end
+
+    subgraph NUMA_1["NUMA NODE 1: Compute & AI Engine"]
+        GK["Gatekeeper Process"]
+        AI["AI Inferer Engine"]
+    end
+
+    XDP <-->|RingBuffer / BPF Maps| GK
+    XDP <-->|RingBuffer / BPF Maps| AI
 ```
 
 1. **NUMA Topological Separation (Cache Thrashing Prevention):**
