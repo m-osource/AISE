@@ -100,20 +100,27 @@ Session management begins on the **BoxA:WAN** interface with handshake validatio
 
 The architecture of the AI Secure Gateway on OpenBSD is built upon strict **Privilege Separation (PrivSep)** principles, attack surface minimization, and deterministic three-tiered resource isolation. The Master Daemon orchestrates the environment and safeguards cryptographic secrets without ever coming into direct contact with untrusted network payload data.
 
-```text
-                  [ LEVEL 0: MASTER ROOT DAEMON (root) ]
-            (Key Custodian / Process Orchestration / Zero Net)
-                                   â”‚
-         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-         â–¼                         â–¼                         â–¼
-[ Auth Verifier Daemon ]  [ Secondary Master CPU 0 ]  [ Secondary Master CPU 1 ]
-  (Database & Auth I/O)      (Level 1: setresuid)        (Level 1: setresuid)
-                                   â”‚                         â”‚
-                             â”Œâ”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”             â”Œâ”€â”€â”€â”€â”€â”´â”€â”€â”€â”€â”€â”
-                             â–¼           â–¼             â–¼           â–¼
-                         [Worker 1]  [Worker 2]    [Worker 3]  [Worker 4]
-                        (Level 2: 1 PID/Session)  (Level 2: 1 PID/Session)
-                         pledge/unveil             pledge/unveil
+```mermaid
+flowchart TD
+    L0["<b>LEVEL 0: MASTER ROOT DAEMON (root)</b><br/>Key Custodian / Process Orchestration / Zero Net"]
+
+    AV["<b>Auth Verifier Daemon</b><br/>Database & Auth I/O"]
+    SM0["<b>Secondary Master CPU 0</b><br/>Level 1: setresuid"]
+    SM1["<b>Secondary Master CPU 1</b><br/>Level 1: setresuid"]
+
+    W1["<b>Worker 1</b><br/>Level 2: 1 PID/Session<br/>pledge / unveil"]
+    W2["<b>Worker 2</b><br/>Level 2: 1 PID/Session<br/>pledge / unveil"]
+    W3["<b>Worker 3</b><br/>Level 2: 1 PID/Session<br/>pledge / unveil"]
+    W4["<b>Worker 4</b><br/>Level 2: 1 PID/Session<br/>pledge / unveil"]
+
+    L0 --> AV
+    L0 --> SM0
+    L0 --> SM1
+
+    SM0 --> W1
+    SM0 --> W2
+    SM1 --> W3
+    SM1 --> W4
 ```
 
 ### 4.1. Tiered Process Hierarchy
