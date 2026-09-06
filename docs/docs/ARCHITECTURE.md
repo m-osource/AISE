@@ -267,15 +267,15 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or tim
 The architecture decouples timer management depending on the execution context and the application layer involved[span_76](start_span)[span_76](end_span):
 
 ### 7.1. Time Field Semantics (`_ns`)
-* **`created_at_ns` (`map_handshake`):** Represents the absolute timestamp when OpenBSD issued the SYN-ACK packet[span_77](start_span)[span_77](end_span). Used to calculate the handshake completion TTL (e.g., 3â€“5 seconds)[span_78](start_span)[span_78](end_span).
+* **`created_at_ns` (`map_handshake`):** Represents the absolute timestamp when OpenBSD issued the SYN-ACK packet[span_77](start_span)[span_77](end_span). Used to calculate the handshake completion TTL (e.g., 3-5 seconds)[span_78](start_span)[span_78](end_span).
 * **`last_seen_ns` (`map_session`):** Represents the timestamp of the last valid packet transmitted on the Fast-Path by the authenticated client (updated with a maximum throttling rate of 1Hz)[span_79](start_span)[span_79](end_span). Determines the hard idle timeout and termination grace time[span_80](start_span)[span_80](end_span).
-* **`until_when_ns` (`map_blacklist` and `map_ip_trespass`):** Represents the exact future timestamp until which every incoming packet from the client must be dropped[span_81](start_span)[span_81](end_span).
+* **`until_when_ns` (`map_blacklist` and `map_ip_trespass`):** Represents the exact future timestamp until which every incoming packet from the client must be dropped.
 
 ### 7.2. Immediate L7 Penalties and Atomic Purging via UDP Teardown
 When the AI Secure Gateway on OpenBSD detects a Layer 7 infraction (e.g., application attack, protocol violation, malicious payload)[span_82](start_span)[span_82](end_span):
 1. The application sends a UDP Teardown message to **BoxA:LAN** containing the client tuple and the penalty duration ($T_{infraction}$)[span_83](start_span)[span_83](end_span).
-2. XDP intercepts the message and executes a two-tiered atomic cleanup[span_84](start_span)[span_84](end_span):
-   * Deletes the entry from **`map_session`** (if the session was promoted)[span_85](start_span)[span_85](end_span).
+2. XDP intercepts the message and executes a two-tiered atomic cleanup:
+   * Deletes the entry from **`map_session`** (if the session was promoted).
    * Deletes the entry from **`map_unauth`**[span_86](start_span)[span_86](end_span).
    * Deletes the entry from **`map_handshake`**[span_87](start_span)[span_87](end_span).
 3. Inserts the tuple into **`map_blacklist`** if the IP is not present in **`map_net_whitelist_dc`**, computing[span_88](start_span)[span_88](end_span):
