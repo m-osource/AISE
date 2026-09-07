@@ -153,14 +153,6 @@ In the event of an anomaly or compromise within a Task Worker (Level 2), the sys
 ### 4.4. Progressive Implementation (Development Roadmap)
 
 * **Phase 1 — Functional Architecture (Linux MVP):** Implementation of a simplified Master1/Master2/Worker model to validate network logic, the eBPF/XDP interface, and the authentication protocol within a coordinated Linux environment.
-* **Phase 2 — Hardening (Production OpenBSD Target):** Deployment of the 3-tiered hierarchy featuring privilege dropping via `setresuid(_sec_master)` at Level 1, 1 PID per task allocation at Level 2, isolated key storage in `mmap`/`mprotect`/`madvise` pages at Level 0, and final sandboxing via `pledge("stdio inet", NULL)` and `unveil(NULL, NULL)`.
-
----
-
-### 4.4. Progressive Implementation (Development Roadmap)
-
-* **Phase 1 — Functional Architecture (Linux MVP):** Implementation of a simplified Master1/Master2/Worker model to validate network logic, the eBPF/XDP interface, and the authentication protocol within a coordinated Linux environment.
-    * **XDP Driver Abstraction:** Design of an abstract network I/O layer to decouple the core logic from Linux-specific hooks, preparing the codebase for OpenBSD's native packet capture utilities (e.g., `bpf(4)`).
     * **Environment Compatibility (Generic XDP):** Enforcement of the `XDP_FLAGS_SKB_MODE` (Generic XDP) constant during early-stage testing to ensure seamless execution across virtualized development environments (VMs/containers) without requiring native hardware driver support.
 
 * **Phase 2 — Hardening (Production OpenBSD Target):** Deployment of the 3-tiered hierarchy tailored to OpenBSD's security primitives, ensuring absolute privilege isolation and mitigation against side-channel attacks.
