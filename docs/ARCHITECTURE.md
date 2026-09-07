@@ -361,7 +361,7 @@ flowchart TD
 
 ---
 
-## :briefcase: Licensing & Commercial Terms
+## Licensing & Commercial Terms
 
 Copyright (c) 2026 Marco Giuseppe Spiga (<workwheat09@gmail.com>).
 
@@ -376,7 +376,7 @@ All software components, eBPF/XDP drivers (Restricted C), OpenBSD integration sc
 
 * **Open-Source Reciprocity:** Any party modifying or building upon this software must keep their derivative works fully open-source under GPLv3.
 
-### :page_facing_up: Commercial Licensing & Consulting Inquiries
+### Commercial Licensing & Consulting Inquiries
 For commercial licensing, enterprise deployment rights, proprietary integrations, or consulting opportunities, please contact the author directly:
 
 * **Author:** Marco Giuseppe Spiga
