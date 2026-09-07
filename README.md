@@ -48,7 +48,6 @@ AISE treats downstream AI inference engines (such as vLLM, SGLang, or llama.cpp)
 
 ## 🚀 Key Architectural Innovations
 
-
 * **Dual-Layer Asymmetric Shield (eBPF/XDP + OpenBSD):** Combines kernel-space line-rate packet filtering via Linux XDP with maximum L7 process isolation on OpenBSD (`pledge`/`unveil`). Malicious traffic is neutralized directly at the Network Interface Card (NIC) level before ever touching the operating system's TCP/IP stack.
 * **Asymmetric AI Threat Isolation & Computational Offloading:** Ingress traffic undergoes high-isolation deterministic filtering on OpenBSD to absorb attack vectors that could compromise the OS. It is then forwarded to the Linux Gatekeeper for CPU-heavy tasks (e.g., token counting, entropy analysis) and dedicated inferer inspection, with full authority to apply direct blacklists via eBPF/XDP. Conversely, AI responses (*Egress*) bypass the Gatekeeper entirely to prevent supply-chain/egress compromise, relying solely on OpenBSD's deterministic isolation.
 * **Blind Authentication & Synchronous 2-Way Control-Loop (`AUTH_CK` / `AUTH_UN` / `AUTH_OK`):** The user-space Auth Verifier remains completely "deaf" to incoming credentials until XDP confirms the L4 flow state via in-kernel `XDP_TX` probes. **Even cryptographically valid credentials are deterministically rejected** if submitted out-of-sequence, via unconfirmed sockets, or in violation of the single-attempt state machine. This fundamentally eliminates enumeration attacks, replay vectors, brute-force attempts, and internal database exposure to unvalidated sockets.
@@ -65,7 +64,8 @@ AISE treats downstream AI inference engines (such as vLLM, SGLang, or llama.cpp)
 
 ### 🏎️ The Ubiquitous Guardian: XDP Layer (Hosted in Box A)
 The XDP framework is physically hosted within **Box A (Linux)**, but its filtering activities are isolated from the rest of the operating system and the AI engines.
-* **Isolation & Driver Execution:** XDP operates at the Network Interface Card (NIC) driver level—intercepting packets before they reach the Linux network stack—and executes its tasks by segregating processing onto dedicated CPU hardware cores. This ensures that network attacks or traffic spikes do not steal computing resources from AI inference.
+
+* **Isolation & Driver Execution:** Running in **Native XDP Mode**, the framework operates directly at the Network Interface Card (NIC) driver level—intercepting packets before they reach the Linux network stack. Processing is strictly bound to isolated CPU cores (via IRQ affinity pinning) to ensure that network attacks or traffic spikes never starve the AI inference engine of computing resources.
 * **Fast-Path Packet Redirection (`XDP_REDIRECT`):** Validated packets intended for OpenBSD (Box B) bypass the standard Linux kernel network stack and are directly forwarded at the driver/NIC level using **`XDP_REDIRECT`** to the target interface.
 * **Symmetric Ingress Validation:** Ingress requests from the internet undergo continuous header and protocol validation through XDP and OpenBSD `pf` before being delivered to the processing layers.
 * **Dynamic, Ecosystem-Driven DDoS Policies:** XDP applies and updates its DDoS mitigation and rate-limiting (packets-per-second) policies by absorbing real-time instructions and telemetry from the entire ecosystem (semantic alerts from Box A's Gatekeeper and coordinated reactive actions from Box B).
