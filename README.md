@@ -2,7 +2,7 @@
 
 ![AISE Architecture Diagram](./AISE%20-%20Advanced%20Infrastructure%20Secure%20Ecosystem.png)
 
-> 💡 **Project Status & Local Simulation Setup:**  
+> **Project Status & Local Simulation Setup:**  
 > This document defines a **Proof of Concept (PoC) architecture meant for single-PC simulation and step-by-step experimentation**. The dual-box ecosystem (Box A Linux + Box B OpenBSD) can be simulated locally on a single machine using hypervisors/VMs (QEMU/KVM, VirtualBox) and network namespaces.
 
 ---
@@ -17,13 +17,14 @@ This repository contains the formal architecture specification, security threat 
 ## 🚀 The Proposed Architecture (The Global XDP Vision)
 The entire ecosystem is structured so that network traffic passes through the **XDP (eXpress Data Path)** framework at the hardware/driver level. XDP manages network filtering, acting as an absolute low-level shield. The related traffic to the system management and repository updates is decoupled from the XDP fast-path and routed over a dedicated Optical Access Line (FTTx interface) directly through Box B. The external node (Box B running OpenBSD) is interconnected in such a way that it communicates with the network exclusively through this protective layer. The **eBPF CO-RE (Compile Once – Run Everywhere)** model allows the system to reuse the same compiled ELF object without requiring recompilation every time the Linux kernel is updated.
 
-### 🔒 Advanced Security & L7 Egress Defense Model
+---
+
+### Advanced Security & L7 Egress Defense Model
 The architecture employs an asymmetric defense mechanism—including how XDP validates L7 UDP teardown messages via exact socket-tuple match to prevent unauthorized client banning even if the Gateway is compromised.
 
 ---
 
-### 🔒 Protocol Design: Why TCP Over UDP & QUIC?
-
+### Protocol Design: Why TCP Over UDP & QUIC?
 While modern HTTP/3 and QUIC utilize UDP for low-latency transport, **AISE intentionally enforces TCP** across its control and proxy paths for deterministic state enforcement:
 
 * **In-Kernel Sequence Validation (`seq_expected`):** TCP’s strict sequence numbering enables XDP to enforce RFC 793 in-window validation directly in BPF maps. This allows the fast-path to drop out-of-order, spoofed, or replayed packets before user-space processing.
@@ -32,7 +33,7 @@ While modern HTTP/3 and QUIC utilize UDP for low-latency transport, **AISE inten
 
 ---
 
-### 🎯 Scope & Ecosystem Focus
+### Scope & Ecosystem Focus
 
 The primary objective of this Proof of Concept (PoC) is **Ecosystem & Network Security Architecture**—specifically, neutralizing L4/L7 volumetric, stateful, and protocol-level threats upstream of sensitive workloads. 
 
@@ -41,13 +42,12 @@ The primary objective of this Proof of Concept (PoC) is **Ecosystem & Network Se
 
 AISE treats downstream AI inference engines (such as vLLM, SGLang, or llama.cpp) as isolated compute backends, focusing entirely on making the surrounding infrastructure unassailable.
 
-> 📝 **Detailed Specification Notice:**  
+> **Detailed Specification Notice:**  
 > The comprehensive technical specification for the L7 XDP/OpenBSD integration is maintained in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
-## 🚀 Key Architectural Innovations
-
+## Key Architectural Innovations
 * **Dual-Layer Asymmetric Shield (eBPF/XDP + OpenBSD):** Combines kernel-space line-rate packet filtering via Linux XDP with maximum L7 process isolation on OpenBSD (`pledge`/`unveil`). Malicious traffic is neutralized directly at the Network Interface Card (NIC) level before ever touching the operating system's TCP/IP stack.
 * **Asymmetric AI Threat Isolation & Computational Offloading:** Ingress traffic undergoes high-isolation deterministic filtering on OpenBSD to absorb attack vectors that could compromise the OS. It is then forwarded to the Linux Gatekeeper for CPU-heavy tasks (e.g., token counting, entropy analysis) and dedicated inferer inspection, with full authority to apply direct blacklists via eBPF/XDP. Conversely, AI responses (*Egress*) bypass the Gatekeeper entirely to prevent supply-chain/egress compromise, relying solely on OpenBSD's deterministic isolation.
 * **Blind Authentication & Synchronous 2-Way Control-Loop (`AUTH_CK` / `AUTH_UN` / `AUTH_OK`):** The user-space Auth Verifier remains completely "deaf" to incoming credentials until XDP confirms the L4 flow state via in-kernel `XDP_TX` probes. **Even cryptographically valid credentials are deterministically rejected** if submitted out-of-sequence, via unconfirmed sockets, or in violation of the single-attempt state machine. This fundamentally eliminates enumeration attacks, replay vectors, brute-force attempts, and internal database exposure to unvalidated sockets.
@@ -62,7 +62,7 @@ AISE treats downstream AI inference engines (such as vLLM, SGLang, or llama.cpp)
 
 ---
 
-### 🏎️ The Ubiquitous Guardian: XDP Layer (Hosted in Box A)
+### The Ubiquitous Guardian: XDP Layer (Hosted in Box A)
 The XDP framework is physically hosted within **Box A (Linux)**, but its filtering activities are isolated from the rest of the operating system and the AI engines.
 
 * **Isolation & Driver Execution:** Running in **Native XDP Mode**, the framework operates directly at the Network Interface Card (NIC) driver level—intercepting packets before they reach the Linux network stack. Processing is strictly bound to isolated CPU cores (via IRQ affinity pinning) to ensure that network attacks or traffic spikes never starve the AI inference engine of computing resources.
@@ -75,7 +75,9 @@ The XDP framework is physically hosted within **Box A (Linux)**, but its filteri
   - **Kernel Space:** Code written in **Restricted C** for ultra-low-level packet processing (eBPF).
   - **User Space Control:** A management program written in **C++**.
 
-### 🔲 BOX A: The Inference & Core Layer (Linux)
+---
+
+### BOX A: The Inference & Core Layer (Linux)
 Hosts the isolated XDP infrastructure, the heavy computational environment, and the deep semantic analysis logic.
 * **Dual AI Engine Architecture:** 
   1. **Main AI Engine:** Powered by **mistral.rs** for high-performance, memory-safe, and optimized AI inference serving the end application.
@@ -83,16 +85,19 @@ Hosts the isolated XDP infrastructure, the heavy computational environment, and 
 * **Gatekeeper:** A software daemon written in Rust that orchestrates Box A, manages the small check-engine to validate requests, and actively instructs the XDP framework to swiftly mitigate hosts attempting semantic attacks at the source.
 * **Policy-Based Update Routing:** All system traffic (updates, telemetry) is explicitly bound via Policy-Based Routing (PBR) or dedicated interfaces to egress exclusively through Box B via the dedicated Optical Access Line (FTTx).
 
-### 🔲 BOX B: The Shield & AI Security Gateway (OpenBSD)
+---
+
+### BOX B: The Shield & AI Security Gateway (OpenBSD)
 Represents the security perimeter exposed to the external network, operating behind the XDP filtering layer.
 * **Operating System:** Native **OpenBSD**, focused on pure infrastructure security and stateful inspection without hosting heavy AI models (leveraging native primitives like `pledge`/`unveil` and `pf`).
 * **Active L7 Teardown via UDP Control Channel:** When the AI Security Gateway detects L7 anomalies or policy violations, it transmits a high-priority UDP control message to Box A's LAN interface. XDP intercepts this message, atomically purges the session from `map_session`/`map_handshake`, adds the client to `map_blacklist`, and immediately drops the UDP command packet (`XDP_DROP`).
 * **Silent Tarpit Defense (Slowloris Mitigation):** When OpenBSD terminates silent/hostile sockets (e.g., via `SO_LINGER(0)`), the generated `TCP RST` packets are intercepted on Box A's LAN interface and silently dropped (`XDP_DROP`). This traps the attacker in a resource-draining timeout loop while freeing OpenBSD resources instantly.
 * **AI Security Gateway:** A deterministic, memory-safe daemon written in Rust running with restricted privileges (`pledge("stdio rpath inet", NULL)`). It performs deep protocol validation and collaborates with Box A's XDP layer via the dedicated UDP Teardown protocol.
 * **On-Demand Egress Whitelisting (`pf` Anchors):** Maintains a zero-trust default posture for outbound traffic. During maintenance cycles, temporary mirror rules are loaded dynamically into dedicated `pf` anchors (`anchor "updates"`) and flushed immediately upon completion.
+
 ---
 
-### 🔄 Dynamic On-Demand Egress Routing (`pf` Anchors)
+### Dynamic On-Demand Egress Routing (`pf` Anchors)
 To avoid tracking shifting CDN mirror IPs inside eBPF maps on Box A, outbound system update traffic (e.g., `dnf update`) is offloaded entirely to a dedicated Optical Access Line (FTTx interface) managed dynamically by OpenBSD `pf` anchors:
 
 ```text
@@ -118,46 +123,50 @@ To avoid tracking shifting CDN mirror IPs inside eBPF maps on Box A, outbound sy
 
 ---
 
-## 🔬 Architectural Roadmap & Future Hardening Ideas
+## Architectural Roadmap & Future Hardening Ideas
 *The following items are design goals and hardening concepts intended for high-assurance hardware setups as the project evolves past the single-PC simulation phase.*
 
-### 🛡️ Box A Hardening Ideas: Native SELinux & XFS (Bare-Metal)
+---
+
+### Box A Hardening Ideas: Native SELinux & XFS (Bare-Metal)
 To minimize host attack surface and eliminate container-escape zero-days:
 * **SELinux (Enforcing Mode):** Enforces strict Mandatory Access Control (MAC) policies over local daemons, isolating the XDP control program and inference engines.
 * **XFS File System:** Chosen for high-performance I/O, rigid permission masks, and native POSIX ACL enforcement.
 * **Bare-Metal Execution Concept:** Eliminates container runtime dependencies (Docker/Podman), removing unnecessary kernel surface exposure and overhead.
 
-### 🔒 Box B Sandboxing: OpenBSD `pledge()`
+---
+
+### Box B Sandboxing: OpenBSD `pledge()`
 The Rust-based **AI Security Gateway** running on Box B uses OpenBSD's native security primitives for extreme process isolation:
 * **Syscall Restricting (`pledge`):** The daemon locks down its execution environment (e.g., `pledge("stdio rpath inet", NULL)`), revoking execution capabilities by omitting the `"exec"` promise and restricting unneeded kernel interfaces.
 
 ---
 
-## ⚡ Technical Advantages & Performance Metrics
+## Technical Advantages & Performance Metrics
 
-### 🔲 Impact on Latency
+### Impact on Latency
 Through the use of XDP technology and optimized virtualized or physical interconnections:
 * **Zero Overhead from Box B:** Box B does not introduce perceptible latency because it performs tasks OpenBSD is natively optimized for (packet parsing, state management, and filtering).
 * **No Volumetric Filtering Overhead on Box A:** Having eliminated L3/L4 DDoS attack attempts on Box B or instantly discarded them via XDP on Box A, the interconnection line handles only clean, legitimate, and pre-validated traffic.
 
-### 🔲 Update Reduction Profile (Kernel Security)
+### Update Reduction Profile (Kernel Security)
 Since Box A is not directly exposed to the Internet and only communicates with the specific IP/MAC of Box B, the network attack surface on the Linux kernel is minimized.
 * **Reduced Patching Cycle:** It is not necessary to reboot or update the Linux kernel of Box A for every public network vulnerability. Reboots of Box A (which are impactful due to reloading large AI models into VRAM) can be planned on long-term schedules, leaving Box B (OpenBSD) the task of undergoing frequent security updates quickly and transparently.
 
-### 🔲 Resource Separation (CPU vs GPU)
+### Resource Separation (CPU vs GPU)
 * **Box A (GPU-Bound / Compute-Bound):** Dedicates its CPUs solely to data offloading over the PCIe/VRAM BUS and its GPUs 100% to executing tensors and language models (`mistral.rs`), without host clock cycles being stolen by network interrupts or packet analysis.
 * **Box B (CPU-Bound / I/O-Bound):** Handles traffic parsing, TLS termination, authentication, network state management, and traffic sanitization to and from the Gatekeeper.
 
 ---
 
-## 🏗️ Conceived Technology Stack
+## Conceived Technology Stack
 * **Network & Filtering Layer (Box A):** XDP Driver Layer (**Restricted C**), XDP User Space Daemon (**C++**).
 * **Box A (Inference & Input Check):** Linux Kernel, Policy-Based Routing (PBR), SELinux + Seccomp + XFS, Gatekeeper (**Rust**), Small Check-Engine, Main AI Engine (**mistral.rs**).
 * **Box B (Pure Security):** OpenBSD Kernel, `pf` firewall with dynamic anchors (`anchor "updates"`), AI Security Gateway (Deterministic **Rust** with `pledge`/`unveil`).
 
 ---
 
-## 📄 Licensing & Commercial Terms
+## Licensing & Commercial Terms
 
 Copyright (c) 2026 Marco Giuseppe Spiga (<workwheat09@gmail.com>).
 
@@ -172,7 +181,7 @@ All software components, eBPF/XDP drivers (Restricted C), OpenBSD integration sc
 
 * **Open-Source Reciprocity:** Any party modifying or building upon this software must keep their derivative works fully open-source under GPLv3.
 
-### 💼 Commercial Licensing & Consulting Inquiries
+### Commercial Licensing & Consulting Inquiries
 For commercial licensing, enterprise deployment rights, proprietary integrations, or consulting opportunities, please contact the author directly:
 
 * **Author:** Marco Giuseppe Spiga
