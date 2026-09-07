@@ -106,7 +106,7 @@ To avoid tracking shifting CDN mirror IPs inside eBPF maps on Box A, outbound sy
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     BOX B (OpenBSD / PF)                                                              │
-│  3. AI Secure Gateway/Daemon dynamically loads mirror IP rules                                               │
+│  3. Daemon dynamically loads mirror IP rules                                                                 │
 │     into PF anchor: `anchor "updates"`                                                                │
 │  4. Stateful PF Inspection evaluates anchor rules; flushes                                            │
 │     anchor immediately upon update completion                                                         │
