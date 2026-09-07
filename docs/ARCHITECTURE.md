@@ -319,6 +319,12 @@ flowchart TD
 1. **NUMA Topological Separation (Cache Thrashing Prevention):**
    * **NUMA Node 0 (Network Fast-Path):** Dedicated exclusively to the Network Interface Card (PCIe NIC), hardware RSS queues, and XDP/eBPF program execution. Keeps session tables (`map_session`, `map_unauth`) warm inside L1/L2/L3 caches of CPU cores reserved strictly for network I/O.
    * **NUMA Node 1 (Compute & AI Logic):** Reserved for heavy payload processing handled by the **AI Inferer Engine** and **Gatekeeper** components. Cross-socket physical isolation prevents L3 cache invalidation caused by loading ML models onto network-dedicated cores.
+   * **NUMA-Aware Map Allocation:** To prevent cross-socket latency, all pinned eBPF maps (`map_session`, `map_unauth`) must be explicitly instantiated within NUMA Node 0 memory banks. The AI Inferer Engine on Node 1 interacts with these maps via standard cross-socket links, preserving the sub-microsecond determinism of the Node 0 network fast-path.
+   * **Deployment & Execution Constraints:** To guarantee that pinned eBPF maps are physically instantiated within **NUMA Node 0** memory banks, the user-space orchestrator/loader must be executed using `numactl`:
+     ```bash
+     numactl --membind=0 --cpunodebind=0 ./xdp_loader_daemon
+     ```
+     This completely eliminates cross-socket Inter-Connect traversal for the network fast-path while allowing the AI engine on Node 1 to safely query metrics via remote lookups.
 
 2. **In-Kernel Packet Steering (`SO_ATTACH_REUSEPORT_EBPF`):**
    * On Linux, incoming traffic distribution utilizes eBPF programs attached to sockets via `SO_ATTACH_REUSEPORT_EBPF`.
