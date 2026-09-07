@@ -157,6 +157,21 @@ In the event of an anomaly or compromise within a Task Worker (Level 2), the sys
 
 ---
 
+### 4.4. Progressive Implementation (Development Roadmap)
+
+* **Phase 1 — Functional Architecture (Linux MVP):** Implementation of a simplified Master1/Master2/Worker model to validate network logic, the eBPF/XDP interface, and the authentication protocol within a coordinated Linux environment.
+    * **XDP Driver Abstraction:** Design of an abstract network I/O layer to decouple the core logic from Linux-specific hooks, preparing the codebase for OpenBSD's native packet capture utilities (e.g., `bpf(4)`).
+    * **Environment Compatibility (Generic XDP):** Enforcement of the `XDP_FLAGS_SKB_MODE` (Generic XDP) constant during early-stage testing to ensure seamless execution across virtualized development environments (VMs/containers) without requiring native hardware driver support.
+
+* **Phase 2 — Hardening (Production OpenBSD Target):** Deployment of the 3-tiered hierarchy tailored to OpenBSD's security primitives, ensuring absolute privilege isolation and mitigation against side-channel attacks.
+    * **Level 1 (Privilege Dropping):** Execution of `setresuid(_sec_master)` to strip root privileges immediately after binding to low-numbered network ports.
+    * **Level 2 (Task Isolation):** Strict allocation of 1 PID per individual task to guarantee process boundaries and faults confinement.
+    * **Level 0 (Isolated Key Storage):** Secure memory management for cryptographic material utilizing `mmap` and `mprotect` for strict read/write access control, combined with `madvise(MADV_DONTDUMP)` and OpenBSD-specific `minherit(MAP_INHERIT_NONE)` to prevent secret leakage across memory dumps and `fork()` boundaries.
+    * **Sandboxing Execution Order:** Final lock-down achieved by calling `unveil(NULL, NULL)` to completely strip file system visibility, followed by `pledge("stdio inet", NULL)` to restrict kernel subsystems. *Note: All memory protections and UID modifications are finalized prior to the pledge call to avoid runtime violations.*
+
+
+---
+
 ### 4.5. TLS Handshake Security Trade-offs and Secret Management
 
 The architecture delegates the entire TLS 1.3 Handshake to the unprivileged worker process of the **AI Security Gateway** (OpenBSD) to maximize I/O performance and eliminate latency overhead associated with asynchronous IPC to the Auth Verifier Daemon.
