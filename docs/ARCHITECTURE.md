@@ -240,7 +240,7 @@ The atomic promotion cycle progresses through three sequential phases:
 Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or timeouts):
 1. XDP extracts the target tuple `(Client_IP, Client_Port)` from the UDP payload.
 2. It attempts atomic deletion of the tuple from the limbo map:
-   $$\text{ret} = \text{bpf\_map\_delete\_elem}(\&\text{map\_unauth}, \&\text{tuple\_key})$$
+   ret = `bpf_map_delete_elem`(&`map_unauth`, &`tuple_key`)
 3. **Atomic Race Condition Management (Single Source of Truth Anti Double-Decrement):**
    * **If $\text{ret} == 0$ (Initial deletion succeeded):** The UDP packet intercepted the event first. It atomically decrements `pending_handshake_count` on **`map_pending_handshake`** and inserts the tuple/IP into **`map_blacklist`** (or **`map_ip_trespass`** if the host is a repeat offender).
    * **If $\text{ret} == -\text{ENOENT}$ (Entry already deleted by `TCP RST`):** This indicates that a `TCP RST` packet already cleaned up the state microseconds prior. The UDP branch **immediately aborts execution without decrementing the counter**, mathematically eliminating any risk of a *double-decrement*.
@@ -279,7 +279,7 @@ When the AI Secure Gateway on OpenBSD detects a Layer 7 infraction (e.g., applic
    * Deletes the entry from **`map_unauth`**.
    * Deletes the entry from **`map_handshake`**.
 3. Inserts the tuple into **`map_blacklist`** if the IP is not present in **`map_net_whitelist_dc`**, computing:
-   $$until\_when\_ns = bpf\_ktime\_get\_ns() + T_{infraction}$$
+   $$`until_when_ns` = `bpf_ktime_get_ns()` + T_{infraction}$$
 4. XDP drops the command UDP packet (`XDP_DROP`). The duration $T_{infraction}$ is dynamically modulated by the AI Secure Gateway based on the severity of the L7 anomaly.
 
 ### 7.3. Recidivism Logic and Cumulative Population in User-Space (`map_ip_trespass`)
