@@ -34,7 +34,6 @@ While modern HTTP/3 and QUIC utilize UDP for low-latency transport, **AISE inten
 ---
 
 ### Scope & Ecosystem Focus
-
 The primary objective of this Proof of Concept (PoC) is **Ecosystem & Network Security Architecture**—specifically, neutralizing L4/L7 volumetric, stateful, and protocol-level threats upstream of sensitive workloads. 
 
 * **In-Scope:** Zero-trust packet filtering, eBPF/XDP driver execution, OpenBSD L7 process isolation (`pledge`/`unveil`), blind authentication state machines, and silent TCP tarpitting.
