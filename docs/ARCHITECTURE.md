@@ -34,16 +34,11 @@ Upon receiving the SYN-ACK packet issued by OpenBSD (BoxB) to the client:
 
 Session management begins on the **BoxA:WAN** interface with handshake validation and continues, in the event of failure or cleanup, with interception of return traffic on the **BoxA:LAN** interface:
 
-1. **Lookup and Success on `map_handshake` (BoxA:WAN):** If the ACK packet completes the TCP 3-Way Handshake (i.e., if it contains an empty 0-byte data payload and the sequence number matches perfectly):
-   * The `(IP, Port)` tuple is not promoted directly to the Fast-Path, but inserted into the limbo BPF Map **`map_unauth_v4 / v6`** (structured as a *Dual Cache Line* to separate WAN read data from LAN window changes).
-   * The entry is removed from `map_handshake` and the packet is forwarded to the AI Security Gateway via `XDP_REDIRECT`.
-
 1. **TCP Header Check, Cascade Lookup, and Handshake Promotion (BoxA:WAN):** Before inspecting **`map_handshake_v4 / v6`**, XDP verifies the TCP ACK flag (ensuring SYN is clear). The packet checks **`map_session_v4 /v6`** first to protect active flows, then if the  tuple is absent checks **`map_unauth_v4 / v6`**.
    * If missing from both tables, XDP checks the payload length and if it doesn't contains an empty 0-byte data payload, it is dropped immediately (`XDP_DROP`) without querying **`map_handshake_v4 / v6`**, otherwise if the packet contains an empty 0-byte data payload, **`map_handshake_v4 / v6`** is queried. If the sequence number matches perfectly  $Seq_{SYN-ACK} + 1$:
      * The (IP, Port) tuple is not promoted directly to the Fast-Path, but inserted into the limbo BPF Map **`map_unauth_v4 / v6`** (structured as a Dual Cache Line to separate WAN read data from LAN window changes).
      * The entry is removed from **`map_handshake_v4 / v6`** and the packet is forwarded to the AI Security Gateway via `XDP_REDIRECT`.
    * Implicit Drop: Any non-SYN packet failing all map lookups and prerequisites is dropped instantly (`XDP_DROP`).
-
 
 2. **In-Window Validation and Rate-Limiting Pre-Auth (BoxA:WAN):** Packets in `map_unauth` travel under strict rate-limiting and in-window checking. Simultaneously, the AI Security Gateway queries the native connection via kernel syscalls (`getpeername()` / `.peer_addr()`) to extract the exact `(IP, Port)` tuple guaranteed by the operating system and send it to the corresponding Auth Verifier Daemon before starting the TLS handshake process.
 
