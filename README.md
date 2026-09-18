@@ -17,6 +17,50 @@ This repository contains the formal architecture specification, security threat 
 ## 🚀 The Proposed Architecture (The Global XDP Vision)
 The entire ecosystem is structured so that network traffic passes through the **XDP (eXpress Data Path)** framework at the hardware/driver level. XDP manages network filtering, acting as an absolute low-level shield. The related traffic to the system management and repository updates is decoupled from the XDP fast-path and routed over a dedicated Optical Access Line (FTTx interface) directly through Box B. The external node (Box B running OpenBSD) is interconnected in such a way that it communicates with the network exclusively through this protective layer. The **eBPF CO-RE (Compile Once – Run Everywhere)** model allows the system to reuse the same compiled ELF object without requiring recompilation every time the Linux kernel is updated. **To ensure ultra-low latency, the two operating systems are directly connected by wire via dedicated fiber optics, providing strict local network isolation, as only Box A's XDP interface processes public internet traffic.**
 
+## Target Production Topology: The 3-Node Physical Mesh
+
+While the entry-level **2-Machine Architecture** (Box A Linux + Box B OpenBSD) provides a budget-optimized production tier that secures WAN ingress, the high-assurance deployment scales into a **3-Machine Physical Mesh**. 
+
+This 3-node physical layout is explicitly designed to isolate high-risk compute hardware and protect both **Box B (OpenBSD)** and the **Public Internet** from internal threats, autonomous AI loops, or compromised inference engines.
+
+### Dual-Namespace DoS Isolation Strategy
+
+A primary attack vector in isolated compute zones is an internal Denial of Service (DoS) flood, where a rogue AI engine on Box C attempts to saturate the upstream security gateway. 
+
+To prevent both external volumetric floods and internal engine floods without introducing hardware bottlenecks, **Box A (XDP Firewall Host)** executes two isolated Linux Network Namespaces across four physical interfaces:
+
+* **Namespace 1 (`netns_wan`):** Manages `BoxA:WAN` and `BoxA:LAN`. Dedicated strictly to public WAN ingress and multi-stage DDoS mitigation:
+  - **BGP / RTBH Integration:** Drops blackholed source networks instantly via FIB reverse lookups.
+  - **Dynamic Threshold SYN Shedding:** Applies token-bucket tracking to shed/drop excess SYN packets once thresholds are crossed, preventing TCP stack exhaustion on OpenBSD.
+  - **State-Enforced Session Filtering:** Unconditionally drops any non-SYN traffic (ACKs, data bursts, spoofed payloads) that does not match an active, authenticated session in eBPF maps (`map_session`), killing flood noise before it reaches the kernel stack.
+* **Namespace 2 (`netns_l4_fw`):** Manages `BoxA:LNK` and `BoxA:DMZ`. Acts as an intermediate L4 eBPF firewall and token-bucket rate limiter positioned directly between the OpenBSD Security Gateway and the AI Compute Engine.
+
+### Physical Architecture & Interconnections
+
+```text
+                     _____________        ____________
+                     | Rocky     |        | OpenBSD  |
+                     |           |        |          |
+Internet <---------> |WAN     LAN| <----> |WAN       |
+                     |           |        |          |
+___________          |           |        |          |
+| Rocky   |          |           |        |          |
+|         |          |           |        | AI       |
+| AI      |          |    XDP    |        | Security |
+| Engine  |          | Firewall  |        | Gateway  |
+|         |          |           |        |          |
+|      WAN| <------> |DMZ     LNK| <----> |LAN       |
+|         |          |           |        |          |
+|  BoxC   |          |   BoxA    |        |   BoxB   |
+-----------          -------------        ------------
+
+* Interface Mappings:
+  - BoxA:WAN <-> Internet     : Public WAN Ingress (netns_wan)
+  - BoxA:LAN <-> BoxB:WAN     : Clean Ingress to OpenBSD Gateway (netns_wan)
+  - BoxB:LAN <-> BoxA:LNK     : Egress/Upstream Requests to L4 Shield (netns_l4_fw)
+  - BoxA:DMZ <-> BoxC:WAN     : L4 Rate-Limited / Screened Link to AI Engine (netns_l4_fw)
+```
+
 ---
 
 ### Advanced Security & L7 Egress Defense Model
