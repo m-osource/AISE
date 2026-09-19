@@ -1,4 +1,4 @@
-## XDP Asymmetric Defense System (Linux) + OpenBSD for L7 Protection with Three-Table Architecture (handshake, unauth, session), Privilege Separation and TLS Tarpit
+## XDP Asymmetric Defense System (Linux) + OpenBSD for L7 Protection with Two-Table Architecture (handshake, session), Privilege Separation and TLS Tarpit
 
 ---
 
@@ -6,14 +6,25 @@
 
 On the external interface **BoxA:WAN**, in addition to the usual header field validation check, blacklist verification and rate limiting are performed exclusively on SYN packets, passing through a pipeline before any stateful processing:
 
-* **RTBH / FIB Reverse Lookup (Zero Maps):** XDP performs a Reverse Route Lookup via the helper function `bpf_fib_lookup()`, checking the route for the packet's source IP. If the source IP falls within a prefix advertised via BGP as `blackhole` or `unreachable`, the packet is instantly dropped (`XDP_DROP`). 
-* **Hostile Host Filter (`map_ip_trespass_v4 / v6`):** Direct-access HASH control containing **exclusively individual Host IPs (`/32` or `/128`)** blocked permanently or administratively/cumulatively. CIDR networks are delegated entirely to the BGP/RTBH layer.
-* **Temporary Blacklist (`map_blacklist_v4 / v6`):** If the client tuple (`session_key_v4 / v6`) is blacklisted and the current time is less than the expiration timestamp (`until_when_ns`), the packet is dropped (`XDP_DROP`).
-* **Stateless Dynamic Handshake Throttling (`map_pending_handshake_v4 / v6`):** To prevent socket exhaustion on OpenBSD and limit simultaneous or brute-force TCP handshake attacks from single IPs, XDP applies a **Token Bucket / Leaky Bucket** algorithm on the `pending_handshake_count` counter:
-  * **Burst Capacity & Ordinary State (`pending_handshake_count < B_MAX`):** Allows an instantaneous burst of concurrent negotiations (e.g., $B_{MAX} = 10 \div 30$) from the same source IP. This prevents *Self-DoS* of legitimate clients behind the same NAT/corporate router following reboots or line failovers. SYN packets are forwarded at line rate (`XDP_REDIRECT`).
-  * **Leaky Rate & Fast-Clear:** The counter is refilled/drained at a strict time interval (e.g., $30/\text{minute}$). As soon as a session passes the `AUTH_UN` probe or completes TLS, the token is immediately returned to the IP's quota (*Fast-Clear*).
-  * **Penalized State / Depleted Bucket (`pending_handshake_count >= B_MAX`):** Burst reserve exhaustion indicates an abnormal accumulation of incomplete sessions (e.g., SYN Flood, fast probes, or sequential brute-force). Subsequent SYN packets from the same IP are dropped directly at the network adapter level (`XDP_DROP`).
-  * **SYN Rate Limiting (`map_syn_ratelimit_v4 / v6`) and Data Center Whitelist:** If a client exceeds the threshold, the Administrative/Data Center Whitelist LPM Trie map (`ip_whitelist_dc_v4 / v6`) is consulted before applying the final block. If the perimeter IP is not whitelisted, the SYN packet is dropped (`XDP_DROP`). Otherwise, an incremental quota is applied and forwarded to OpenBSD via `XDP_REDIRECT`.
+* **RTBH / FIB Reverse Lookup (Zero Maps):** XDP performs a Reverse Route Lookup via the helper function `bpf_fib_lookup()`, checking the route for the packet's source IP. If the source IP falls within a prefix advertised via BGP as `blackhole` or `unreachable`, the packet is instantly dropped (`XDP_DROP`).
+* **Volumetric SYN-Flood Mitigation (`map_cpu_syn_stats`):** To shield the OpenBSD Gateway (**Box B**) from state-table saturation under volumetric L4 SYN-floods, **Box A** executes an early-stage probabilistic **Per-CPU Lockless Filter** at **Cycle 0** (XDP driver layer).
+  * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta ($\Delta t = t_{\text{now}} - t_{\text{last\_seen}}$) without atomic operations.
+  * **User-Space Dynamic Scaling:** The User-Space Control Daemon (C++) calculates the per-CPU inter-arrival threshold ($\Delta t_{\text{min\_cpu}}$) based on OpenBSD’s target capacity ($R_{\text{max}}$) and active NIC RSS queues ($N_{\text{cpu}}$):
+    $$\Delta t_{\text{min\_cpu}} = \frac{1.000.000.000 \times N_{\text{cpu}}}{R_{\text{max}}}$$
+  * **Instantaneous Enforcement:** Thresholds are injected into eBPF `.rodata` at loader boot. If $\Delta t < \Delta t_{\text{min\_cpu}}$, an in-register pseudo-random discriminator probabilistically drops packet bursts at Cycle 0, delivering a clean, rate-capped SYN stream to OpenBSD.
+* **Tuple SYN Protection & DoS Mitigation Logic:** Incoming `SYN` packets are evaluated against `map_session_v4 / v6` using the client tuple/IP. The `until_when_ns` field serves as the single source of truth for both traffic enforcement and record lifecycle.
+  * **Permanent Blacklist (`until_when_ns == 0`):** If the tuple exists with `until_when_ns == 0`, the `SYN` packet is unconditionally dropped (`XDP_DROP`).
+  * **Timed Blacklist (`until_when_ns > 0`):** 
+    * **Active / Unexpired ($t_{\text{current}} < t_{\text{until\_when\_ns}}$):** The `SYN` packet is dropped (`XDP_DROP`). The WAN Garbage Collector is strictly prohibited from deleting the entry while the timestamp plus the Grace-Timeout ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$) remains in the future.
+    * **Expired ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$):** XDP deletes the record from the map. Once removed, subsequent `SYN` packets matching this tuple pass the check and undergo `XDP_REDIRECT` toward the processing pipeline.
+* **Individual Host IPs (`/32` or `/128`) anomalies mitigation (`map_mitigation_v4 / v6`) and Data Center Whitelist:**
+  After consulted the Administrative/Data Center Whitelist LPM Trie map (`ip_whitelist_dc_v4 / v6`) to ensure that administrative address are not included, performs:
+  * **Hostile Host Filter:** Direct-access HASH control blocked administratively/cumulatively ($t_{\text{current}} < t_{\text{until\_when\_ns}}$) for a short time (hours/days) until the address is handled by BGP/RTBH layer. CIDR networks are delegated entirely to the BGP/RTBH layer.
+  * **Stateless Dynamic Handshake Throttling:** To prevent socket exhaustion on OpenBSD and limit simultaneous or brute-force TCP handshake attacks from single IPs, XDP applies a **Token Bucket / Leaky Bucket** algorithm on the `pending_handshake_count` counter:
+    * **Burst Capacity & Ordinary State (`pending_handshake_count < B_MAX`):** Allows an instantaneous burst of concurrent negotiations (e.g., $B_{MAX} = 10 \div 30$) from the same source IP. This prevents *Self-DoS* of legitimate clients behind the same NAT/corporate router following reboots or line failovers. SYN packets are forwarded at line rate (`XDP_REDIRECT`).
+    * **Leaky Rate & Fast-Clear:** The handshake counter is refilled at a strict background rate (e.g., 30/minute) to constrain unauthenticated probes. As soon as the **Auth Verifier** (Control Plane) validates the connection and issues an `AUTH_OK` state promotion (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`), the consumed token is **immediately refunded to the source IP's quota (*Fast-Clear*)**, allowing legitimate users to establish concurrent authenticated sessions without rate-limiting friction.
+      * **Penalized State / Depleted Bucket (`pending_handshake_count >= B_MAX`):** Burst reserve exhaustion indicates an abnormal accumulation of incomplete sessions (e.g., SYN Flood, fast probes, or sequential brute-force). Subsequent SYN packets from the same IP are dropped directly at the network adapter level (`XDP_DROP`).
+  * **SYN Rate Limiting:** If a client exceeds the threshold (`tokens`) the SYN packet is dropped (`XDP_DROP`). Otherwise, an incremental quota is applied and forwarded to OpenBSD via `XDP_REDIRECT`.
 
 ---
 
@@ -26,29 +37,31 @@ Upon receiving the SYN-ACK packet issued by OpenBSD (BoxB) to the client:
   * **Expected Sequence Number:** $Seq_{SYN-ACK} + 1$
   * **TCP Initial Window Size:** Window size declared by OpenBSD.
   * **Creation Timestamp (`created_at_ns`):** Generated via `bpf_ktime_get_ns()` to calculate the handshake timeout (e.g. 3-5 seconds).
-* **Pending Handshake Counter Increment:** XDP atomically increments (`__sync_fetch_and_add`) the `pending_handshake_count` value and updates `last_syn_ack_ns` in the `map_pending_handshake_v4 / v6` map for the client IP, triggering dynamic throttling for subsequent SYNs from the same IP.
+* **Pending Handshake Counter Increment:** XDP atomically increments (`__sync_fetch_and_add`) the `pending_handshake_count` value and updates `last_syn_ack_ns` in the `map_mitigation_v4 / v6` map for the client IP, triggering dynamic throttling for subsequent SYNs from the same IP.
 
 ---
 
-## 3. Validate First ACK, Pre-Authentication Limbo (`map_unauth`), and TLS Tarpit
+## 3. Validate First ACK, Pre-Authentication Limbo (`SESSION_GREETING`), and TLS Tarpit
 
 Session management begins on the **BoxA:WAN** interface with handshake validation and continues, in the event of failure or cleanup, with interception of return traffic on the **BoxA:LAN** interface:
 
-1. **TCP Header Check, Cascade Lookup, and Handshake Promotion (BoxA:WAN):** Before inspecting **`map_handshake_v4 / v6`**, XDP verifies the TCP ACK flag (ensuring SYN is clear). The packet checks **`map_session_v4 /v6`** first to protect active flows, then if the  tuple is absent checks **`map_unauth_v4 / v6`**.
-   * If missing from both tables, XDP checks the payload length and if it doesn't contains an empty 0-byte data payload, it is dropped immediately (`XDP_DROP`) without querying **`map_handshake_v4 / v6`**, otherwise if the packet contains an empty 0-byte data payload, **`map_handshake_v4 / v6`** is queried. If the sequence number matches perfectly  $Seq_{SYN-ACK} + 1$:
-     * The (IP, Port) tuple is not promoted directly to the Fast-Path, but inserted into the limbo BPF Map **`map_unauth_v4 / v6`** (structured as a Dual Cache Line to separate WAN read data from LAN window changes).
+1. **TCP Header Check, Cascade Lookup, and Handshake Promotion (BoxA:WAN):** Before inspecting **`map_handshake_v4 / v6`**, XDP verifies the TCP ACK flag (ensuring SYN is clear). The packet checks **`map_session_v4 /v6`** first to protect active flows.
+   * If missing from the table, XDP checks the payload length and if it doesn't contains an empty 0-byte data payload, it is dropped immediately (`XDP_DROP`) without querying **`map_handshake_v4 / v6`**, otherwise if the packet contains an empty 0-byte data payload, **`map_handshake_v4 / v6`** is queried. If the sequence number matches perfectly  $Seq_{SYN-ACK} + 1$:
+     * The (IP, Port) tuple is not promoted directly to the Fast-Path, but inserted into the limbo (through the `SESSION_GREETING` status active on both cache lines) **through the creation of a new record into BPF Map `map_session_v4 / v6`** (structured as a Dual Cache Line to separate WAN read data from LAN window changes) with also the greeting timeout: `until_greet_when_ns` = `bpf_ktime_get_ns()` + $T_{timeout}$ and the copy of `seq_expected` and `window_size` already present in **`map_handshake_v4 / v6`**.
      * The entry is removed from **`map_handshake_v4 / v6`** and the packet is forwarded to the AI Security Gateway via `XDP_REDIRECT`.
    * Implicit Drop: Any non-SYN packet failing all map lookups and prerequisites is dropped instantly (`XDP_DROP`).
 
-2. **In-Window Validation and Rate-Limiting Pre-Auth (BoxA:WAN):** Packets in `map_unauth` travel under strict rate-limiting and in-window checking. Simultaneously, the AI Security Gateway queries the native connection via kernel syscalls (`getpeername()` / `.peer_addr()`) to extract the exact `(IP, Port)` tuple guaranteed by the operating system and send it to the corresponding Auth Verifier Daemon before starting the TLS handshake process.
+2. **In-Window Validation and Rate-Limiting Pre-Auth (BoxA:WAN):** Packets belonging the status `SESSION_GREETING` travel under strict rate-limiting and in-window checking. Simultaneously, the AI Security Gateway queries the native connection via kernel syscalls (`getpeername()` / `.peer_addr()`) to extract the exact `(IP, Port)` tuple guaranteed by the operating system and send it to the corresponding Auth Verifier Daemon before starting the TLS handshake process.
 
-3. **Hardened Anchor and Existence Probe (`AUTH_CK` / `AUTH_UN`) (BoxA:LAN):**
-   * Before processing or attempting to verify any credentials (username/password/mTLS), the Auth Verifier Daemon sends a UDP `AUTH_CK` packet to XDP specifying the tuple extracted from the socket, to ensure that a regular Pre-Authentication phase is actually in progress for that tuple, confirmed by the presence of the record and the receipt of `AUTH_UN`.
+3. **SYN Protection / DoS Mitigation:** As explained at section 1 the existence of the tuple  in **`map_session_v4 /v6`** immediately involve the dropping of any additional or duplicate `SYN` packets coming from the same source IP and port, protecting the OpenBSD operative system from reconnection attempts or SYN-Floods.
+   
+4. **Hardened Anchor and Existence Probe (`AUTH_CK` / `AUTH_UN`) (BoxA:LAN):**
+   * Before processing or attempting to verify any credentials (username/password/mTLS), the Auth Verifier Daemon sends a UDP `AUTH_CK` packet to XDP specifying the tuple extracted from the socket, to ensure that a regular Pre-Authentication (`SESSION_GREETING`) phase is actually in progress for that tuple, confirmed by the presence of the record and the receipt of `AUTH_UN`.
    * **Out-of-Band Communication and Stateless Nature (UDP Only):** The Auth Verifier operates exclusively on an asynchronous UDP channel in completely *stateless* mode. It does not retain session state in memory: once the single verification is complete, it instantly frees all local resources.
-   * **Atomic Anti-Replay and Self-Purge Check (`auth_ck_count`):** Each entry in `map_unauth` includes an 8-bit atomic counter field (`auth_ck_count`). Upon receiving the `AUTH_CK` packet:
-     * **Tuple Missing (`ENOENT`):** If the tuple is not found in the `map_unauth` table, the session is not in the Pre-Authentication state. XDP ignores the request and does not emit an `AUTH_UN` packet.
-     * **First Login (`auth_ck_count == 1`):** If the tuple is present, XDP atomically increments the value, validates the tuple, and responds via `XDP_TX` with `AUTH_UN`, confirming the limbo state.
-     * **Anomalous or Recurring Attempt (`auth_ck_count > 1`):** If the counter exceeds the first call for the same tuple, XDP interprets the event as an anomaly/replay attack, immediately deletes the record from `map_unauth`, and breaks the loop without sending `AUTH_UN`, ensuring instant self-cleaning of the table.
+   * **Atomic Anti-Replay and Self-Purge Check (`auth_ck_count`):** Each entry in `map_session_v4 / v6` includes an 8-bit atomic counter field (`auth_ck_count`). Upon receiving the `AUTH_CK` packet:
+     * **Tuple Missing (`ENOENT`):** If the tuple is not found in the `map_session_v4 / v6` table or it is not in `SESSION_GREETING` status, the session is not in the Pre-Authentication state. XDP ignores the request and does not emit an `AUTH_UN` packet.
+     * **First Login (`auth_ck_count == 1`):** If the tuple is present in `SESSION_GREETING` status, XDP atomically increments the value, validates the tuple, and responds via `XDP_TX` with `AUTH_UN`, confirming the limbo state.
+     * **Anomalous or Recurring Attempt (`auth_ck_count > 1`):** If the counter exceeds the first call for the same tuple, XDP interprets the event as an anomaly/replay attack, immediately deletes the record from `map_session_v4 / v6`, and breaks the loop without sending `AUTH_UN`, ensuring instant self-cleaning of the table.
    * **Master Privilege Separation & Multi-Tier Blast Radius Isolation (OpenBSD Target Architecture):**
      * **Three-Level Architecture (Tiered Process Hierarchy):**
        * **Level 0 — Master Root Daemon (Privileged Key Custodian):** Holds root privileges, manages the primary process table via `waitpid()`, and is the only component authorized to generate and store TLS private keys in protected anonymous memory (`mmap` with `MAP_ANON | MAP_PRIVATE`, `madvise(MADV_DONTDUMP)`, and `mprotect`). It never manages network sockets or performs direct handshakes.
@@ -70,10 +83,10 @@ Session management begins on the **BoxA:WAN** interface with handshake validatio
    * **Enumeration & Brute-Force Inhibition (Failure to Detect `AUTH_UN` as an Attack Indicator):** If the `AUTH_UN` packet is not received following the `AUTH_CK` probe, the Auth Verifier classifies the event as an **ongoing attack or network anomaly**. The daemon immediately stops all processing without accessing the application database and without storing contexts. The `(IP, Port)` tuple is deterministically discarded at the network level by XDP.
    * *Note on Architectural Maturity:* At the current stage (MVP/Base), attack isolation occurs exclusively at the stateless network and process levels (Zero-DB). Updating the risk status to the Database (with policy persistence and garbage collection) is planned as a future evolution of the infrastructure.
 
-4. **Incomplete TLS Handling / mTLS Failure (BoxA:LAN and TLS Tarpit):**
+5. **Incomplete TLS Handling / mTLS Failure (BoxA:LAN and TLS Tarpit):**
    * Upon negotiation failure in step 3 (or due to invalid TLS/mTLS), the native OpenBSD stack closes the socket and issues a `TCP RST` (via `SO_LINGER(0)`).
    * XDP intercepts the `TCP RST` on the **BoxA:LAN** interface, extracts the `(IP, Port)` tuple, and performs atomic sanitization:
-     1. Deletes the `(IP, Port)` tuple from **`map_unauth`** via `bpf_map_delete_elem()`.
+     1. Deletes the `(IP, Port)` tuple from **`map_session_v4 / v6`** in status `SESSION_GREETING` via `bpf_map_delete_elem()`.
      2. **Only if deletion returns `0` (Success):** Atomically decrement (`__sync_fetch_and_sub`) the `pending_handshake_count` on **`map_pending_handshake`** and apply the silent **`XDP_DROP` of the `TCP RST`** before it can reach the WAN.
    * **Tarpit Effect:** The attacker is stuck waiting for a socket timeout, saturating its own resources, while OpenBSD and Box A have already freed memory and reset the local state without exposing error responses to the outside world.
 
@@ -148,14 +161,14 @@ In the event of an anomaly or compromise within a Task Worker (Level 2), the sys
 ### 4.3. CPU Core-Pinning, Affinity, and Queue Mapping
 
 * To eliminate context-switching overhead and avoid L1/L2 cache contention, each **Secondary Master (Level 1)** and its child **Task Workers (Level 2)** are bound to a specific CPU core using native kernel affinity primitives.
-* Core allocation directly mirrors the Receive Side Scaling mapping on the network interface (**NIC RSS Multi-Queue**), ensuring that packets for a given session are consistently processed on the same physical CPU core to preserve cache locality.
+* Core allocation directly mirrors the Receive Side Scaling mapping on the network interface (**NIC Receive Side Scaling (RSS) Multi-Queue**), ensuring that packets for a given session are consistently processed on the same physical CPU core to preserve cache locality.
 
 ---
 
 ### 4.4. Progressive Implementation (Development Roadmap)
 
 * **Phase 1 — Functional Architecture (Linux MVP):** Implementation of a simplified Master1/Master2/Worker model to validate network logic, the eBPF/XDP interface, and the authentication protocol within a coordinated Linux environment.
-    * **Environment Compatibility (Generic XDP):** Enforcement of the `XDP_FLAGS_SKB_MODE` (Generic XDP) constant during early-stage testing to ensure seamless execution across virtualized development environments (VMs/containers) without requiring native hardware driver support.
+    * **Environment Compatibility (Generic XDP plus Receive Packet Steering (RPS)):** Enforcement of the `XDP_FLAGS_SKB_MODE` (Generic XDP) constant during early-stage testing to ensure seamless execution across virtualized development environments (VMs/containers) without requiring native hardware driver support.
 
 * **Phase 2 — Hardening (Production OpenBSD Target):** Deployment of the 3-tiered hierarchy tailored to OpenBSD's security primitives, ensuring absolute privilege isolation and mitigation against side-channel attacks.
     * **Level 1 (Privilege Dropping):** Execution of `setresuid(_sec_master)` to strip root privileges immediately after binding to low-numbered network ports.
@@ -179,7 +192,9 @@ The architecture delegates the entire TLS 1.3 Handshake to the unprivileged work
 To reduce the window of potential abuse to the absolute theoretical minimum:
 1. **Short-Lived Certificates:** Deployment of server certificates with aggressive automated rotation (e.g., 24–48 hours validity).
 2. **Mutual TLS (mTLS):** Bidirectional cryptographic authentication; possession of the Server private key alone does not allow an attacker to impersonate an authorized client.
-3. **Restrictive Sandboxing (`pledge` / `unveil` + `zeroize`):** Total inhibition of process execution (`execve`) and filesystem dumps, combined with active `ZeroizeOnDrop` memory scrubbing for ephemeral session keys.
+3. **Short-Lived Ephemeral mTLS:** Instead of relying on long-lived credentials, clients are issued short-lived ephemeral certificates (e.g., valid for 1 to 12 hours) dynamically provisioned via automated PKI toolchains (such as SPIFFE/SPIRE, HashiCorp Vault, or ACME). This eliminates the overhead of manual CRL/OCSP revocation; if an anomaly is detected, the Identity Authority simply denies certificate renewal, revoking access automatically upon expiration.
+4. **Public Key Pinning (Anti-Hijack Defense):** The client application hardcodes the expected public key/fingerprint of the gateway. Even if an attacker hijacks BGP/DNS routes or misuses a compromised Public CA to issue a valid domain certificate, the client immediately drops the handshake because the pinned gateway key does not match.
+5. **Restrictive Sandboxing (`pledge` / `unveil` + `zeroize`):** Total inhibition of process execution (`execve`) and filesystem dumps, combined with active `ZeroizeOnDrop` memory scrubbing for ephemeral session keys.
 
 ---
 
@@ -193,16 +208,16 @@ The atomic promotion cycle progresses through three sequential phases:
    Upon receiving an authentication request, the Auth Verifier Daemon holding the `(Client_IP, Client_Port)` tuple sends an `AUTH_CK` UDP packet to XDP to query the L4 connection state.
 
 2. **Hardware Confirmation and Pre-Auth Validation (`AUTH_UN` via `XDP_TX`):** 
-   * XDP intercepts `AUTH_CK` on the LAN side and verifies the tuple's presence in **`map_unauth`**.
+   * XDP intercepts `AUTH_CK` on the LAN side and verifies the tuple's presence in **`map_session_v4 / v6`** with status `SESSION_GREETING` and `until_greet_when_ns` < `bpf_ktime_get_ns()`.
    * If present, it instantly responds to the Auth Verifier via `XDP_TX` with an `AUTH_UN` UDP packet.
-   * **Negative Outcome:** If the tuple does not exist in `map_unauth` (e.g., connection absent or already expired), XDP does not emit `AUTH_UN`. The Auth Verifier marks the credentials as invalid regardless, halts processing without wasting CPU cycles, and logs the anomaly.
+   * **Negative Outcome:** If the tuple does not exist in (e.g., connection absent or already expired), XDP does not emit `AUTH_UN`. The Auth Verifier marks the credentials as invalid regardless, halts processing without wasting CPU cycles, and logs the anomaly.
 
 3. **Final Fast-Path Promotion (`AUTH_OK`):** 
    Only following an `AUTH_UN` confirmation and subsequent application/TLS credential validation does the Auth Verifier Daemon transmit an `AUTH_OK` UDP packet toward the **BoxA:LAN** interface:
    * **Silent Interception:** XDP intercepts the `AUTH_OK` packet and silently consumes it (`XDP_DROP`).
-   * **Atomic Promotion:** It reads the current state accumulated inside **`map_unauth`** (including the real-time updated `seq_expected` and `window_size`) and copies it directly into the BPF Map **`map_session_v4 / v6`** (Fast-Path).
-   * **Removal from Provisional State:** It deletes the `(Client_IP, Client_Port)` tuple from **`map_unauth`**.
-   * **SYN Protection / DoS Mitigation:** It inserts the same tuple into **`map_blacklist_v4 / v6`**, setting `until_when_ns = 0`. This special marker forces the XDP Fast-Path to immediately drop any additional or duplicate `SYN` packets directed toward the active session, protecting the backend from reconnection attempts or SYN-Floods while the session is open. The tuple will be atomically removed from the blacklist only upon session closure (when `until_when_ns == 0`).
+   * **Atomic Promotion (`SESSION_ACTIVE`):** On Cache-Line 1 the `SESSION_GREETING` status is promoted to Fast-Path (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`). On the WAN side while XDP is in `SESSION_GREETING` on Cache-Line 0 when receives a valid TCP ACK it always looks for `SESSION_ACTIVE` on Cache-Line 1 to promote the status on its Cache-Line.
+  * **SYN Protection / DoS Mitigation (BoxA:WAN):** The presence of an unexpired tuple in `map_session_v4 / v6` enforces immediate SYN-Flood protection at the WAN interface. Any incoming `SYN` matching an active block (`until_when_ns == 0` or $t_{\text{current}} < t_{\text{until\_when\_ns}}$) is dropped unconditionally (`XDP_DROP`) before state allocation or resource consumption can occur.
+  * **Established Session Interception:** Any ongoing session traffic (including `ACK`, `PSH`, or `FIN` in either direction) matching an unexpired `until_when_ns` timestamp is dropped instantly at Layer 0 (`XDP_DROP`), cutting off active streams without processing payload or updating session state.
    * **Counter Update:** It atomically decrements (`__sync_fetch_and_sub`) the `pending_handshake_count` metric on **`map_pending_handshake`**.
    * **Line-Rate Forwarding:** From this moment forward, session traffic travels at line-rate on the Fast-Path WAN $\rightarrow$ LAN pipeline, protected by TCP window consistency checks.
 
@@ -215,26 +230,26 @@ The atomic promotion cycle progresses through three sequential phases:
 * **Resilience to Blind Sequence Attacks:** If an attacker sends packets with randomized sequence numbers spoofing an active client, XDP drops them on the first CPU cycle. The client's entry in `map_session` **remains unaltered and unpurged**, safeguarding legitimate connections from forced disconnections.
 * **Resilience to Slowloris Attacks and Sandbox Isolation:** 
   * **TLS Failure Tarpit (AI Security Gateway):** If the TLS/mTLS negotiation fails prior to authentication, the AI Security Gateway closes the socket by issuing a `TCP RST`. XDP on **BoxA:LAN** intercepts the `TCP RST`, purges the session from `map_unauth`, decrements `pending_handshake_count`, and executes a **silent `XDP_DROP` of the `TCP RST`** toward the WAN. The attacker remains stalled waiting for a timeout (Tarpit), while OpenBSD and Box A have already cleared their local state.
-  * **Auth Failure & Sandbox Defense (Auth Verifier Daemon):** If the TLS handshake succeeds but L7 authentication fails, teardown is delegated to the **Auth Verifier Daemon**. It sends a `TEARDOWN` UDP packet over the LAN network to **BoxA:LAN** to promote (if necessary) the tuple into `map_blacklist` and clear the BPF state. The UDP packet is strictly for internal control plane use (never forwarded to the WAN by XDP), rendering any tampering attempt by a compromised worker futile.
+  * **Auth Failure & Sandbox Defense (Auth Verifier Daemon):** If the TLS handshake succeeds but L7 authentication fails, teardown is delegated to the **Auth Verifier Daemon**. It sends a `TEARDOWN` UDP packet over the LAN network to **BoxA:LAN** to promote (if necessary) the tuple into `map_blacklist_v4 / v6` and clear the BPF state. The UDP packet is strictly for internal control plane use (never forwarded to the WAN by XDP), rendering any tampering attempt by a compromised worker futile.
 * **Timestamp Optimization (1Hz Throttling):** To eliminate unnecessary memory I/O on high-throughput flows, XDP updates the `last_seen_ns` field of a session only if at least 1 second has elapsed since the previous update.
 * **LAN-Side Window Updates:** Response packets sent from OpenBSD back to the client update the TCP window size (`window_size`) inside the second cache line of the session structure without invalidating the cache line used by the WAN Fast-Path.
 * **Selective Handling and Bidirectional Synchronization of Closure (`RST`/`FIN`):**
-  * **Unauthenticated Sessions (`map_unauth` present):** XDP intercepts `RST` packets generated by OpenBSD and drops them (`XDP_DROP`). The termination of an unvalidated session is managed via a *silent-drop* model, ensuring complete Gateway stealth and preventing information leakage during perimeter scans.
-  * **Authenticated Sessions (`map_unauth` absent):**
+  * **Unauthenticated Sessions (`map_session_v4 / v6` with `SESSION_GREETING`):** XDP intercepts `RST` packets generated by OpenBSD and drops them (`XDP_DROP`). The termination of an unvalidated session is managed via a *silent-drop* model, ensuring complete Gateway stealth and preventing information leakage during perimeter scans.
+  * **Authenticated Sessions (`map_session_v4 / v6` with valid `SESSION_ACTIVE`):**
     * **Immediate Termination via `RST`:** Receiving an `RST` packet (from LAN or WAN) triggers immediate forwarding (`XDP_REDIRECT`) to inform the remote peer, alongside an instantaneous atomic removal of the entry from the BPF map (`bpf_map_delete_elem`), freeing resources immediately.
     * **Phased `FIN` Termination (`SESSION_CLOSING`):** Upon the passage of the first `FIN` packet (from either direction, LAN or WAN), the session state on that specific Cache Line transitions from `SESSION_ACTIVE` to `SESSION_CLOSING`.
-      * **Instant Purge on ACK (RFC 793/9293 Compliance):** The simultaneous presence of `SESSION_CLOSING` on both Cache Lines attests to the completion of the bidirectional 4-way teardown handshake in full compliance with TCP standards. This authorizes either XDP pipeline/process (LAN or WAN) to instantly purge the session from the BPF map (`bpf_map_delete_elem`) upon receiving the subsequent `ACK` packet, while atomically removing the tuple from `map_blacklist_v4 / v6` if present with `until_when_ns == 0`.
+      * **Instant Purge on ACK (RFC 793/9293 Compliance):** The simultaneous presence of `SESSION_CLOSING` on both Cache Lines attests to the completion of the bidirectional 4-way teardown handshake in full compliance with TCP standards. This authorizes either XDP pipeline/process (LAN or WAN) to instantly purge the session from the BPF map (`bpf_map_delete_elem`) upon receiving the subsequent `ACK` packet.
       * **Garbage Collector Fallback:** Should teardown fail to complete with the final ACK (e.g., due to packet loss), even a single-sided `SESSION_CLOSING` state enables the Garbage Collector to reclaim the session and its blacklist entry upon the expiration of a reduced *Grace-Timeout* (2–5s).
 
 ### 5.2. Sanctions and Immediate Termination (`TEARDOWN`)
-Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or timeouts):
-1. XDP extracts the target tuple `(Client_IP, Client_Port)` from the UDP payload.
-2. It attempts atomic deletion of the tuple from the limbo map:
-   ret = `bpf_map_delete_elem`(&`map_unauth`, &`tuple_key`)
-3. **Atomic Race Condition Management (Single Source of Truth Anti Double-Decrement):**
-   * **If $\text{ret} == 0$ (Initial deletion succeeded):** The UDP packet intercepted the event first. It atomically decrements `pending_handshake_count` on **`map_pending_handshake`** and inserts the tuple/IP into **`map_blacklist`** (or **`map_ip_trespass`** if the host is a repeat offender).
-   * **If $\text{ret} == -\text{ENOENT}$ (Entry already deleted by `TCP RST`):** This indicates that a `TCP RST` packet already cleaned up the state microseconds prior. The UDP branch **immediately aborts execution without decrementing the counter**, mathematically eliminating any risk of a *double-decrement*.
-4. XDP executes a **silent `XDP_DROP` on the control UDP packet**.
+
+Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or policy enforcement):
+1. XDP extracts the target tuple `(Client_IP, Client_Port)` from the control payload.
+2. It performs an atomic lookup/update on **`map_session_v4 / v6`** to transition the session state to blacklisted by setting `until_when_ns` (**`map_ip_trespass`** if the host is a repeat offender or $t_{\text{current}} + \text{duration\_ns}$ for timed eviction).
+3. **Atomic State & Counter Management (Single Source of Truth):**
+   * **If session is active/pending:** XDP updates `until_when_ns` to enforce immediate bidirectional dropping (`XDP_DROP`). If the session was still in the handshake phase, it atomically decrements `pending_handshake_count` on **`map_pending_handshake`**.
+   * **If entry is already blacklisted or absent:** If `until_when_ns` is already active or the entry was previously cleaned up, XDP aborts execution without modifying global counters, mathematically eliminating any risk of a *double-decrement*.
+4. XDP executes a silent **`XDP_DROP`** on the `TEARDOWN` UDP packet.
 
 ---
 
@@ -243,12 +258,10 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or tim
 | Map / Table | BPF Type | Architecture & Operational Purpose | Eviction & Lifecycle |
 | :--- | :--- | :--- | :--- |
 | **`map_handshake`** | `BPF_MAP_TYPE_LRU_HASH` | Temporary TCP completion tracking (SYN-ACK $\rightarrow$ ACK). | Fast expiration (3–5s) or cleanup via garbage collector. |
-| **`map_pending_handshake`** | `BPF_MAP_TYPE_HASH` | Per-IP counters (`pending_handshake_count`) for Dynamic Handshake Throttling. | Decremented via UDP or upon RST Tarpit drop after clearing from `map_unauth`. |
-| **`map_unauth`** | `BPF_MAP_TYPE_LRU_HASH` | **Limbo Pre-Auth Dual Cache Line**: Rate-limiting and in-window validation before login. | Promoted to `map_session`, deleted via UDP Teardown or LRU eviction. |
-| **`map_session`** | `BPF_MAP_TYPE_HASH` | **Fast-Path Dual Cache Line**: Authenticated flows exempt from rate-limiting. | Removal via UDP L7 Teardown or passive Grace Period (5–10s). |
-| **`map_blacklist`** | `BPF_MAP_TYPE_HASH` | Temporary session ban for L7 penalties. | Automatic deletion after `until_when_ns` expires. |
-| **`map_ip_trespass`** | `BPF_MAP_TYPE_HASH` | Hard block for repeat offenders (`/32` or `/128`). | Populated by User-Space daemon on cumulative computation. |
-| **`map_syn_ratelimit`** | `BPF_MAP_TYPE_LRU_HASH` | **SYN rate limiting**: Rate limiting metrics per IP. | Deletion via LRU eviction. |
+​| map_session | BPF_MAP_TYPE_HASH | Unified session & dynamic blacklist table using until_when_ns enforcement. | Updated on AUTH_OK/TEARDOWN; cleared by user-space GC, expired until_when_ns, or inline cleanup. |
+| **`map_net_whitelist_dc`** | `BPF_MAP_TYPE_LPM_TRIE` | Data center network address and CIDR map. | Updated via User Space program. |
+| **`map_mitigation`** | `BPF_MAP_TYPE_LRU_HASH` | `Client_IP` → `struct mitigation_value` | Unified IP tracking for transient trespass escalation, token-bucket SYN rate-limiting, and pending handshakes. Enforces dynamic local bans to bridge traffic until upstream RTBH propagation takes effect. |
+| map_cpu_syn_stats | BPF_MAP_TYPE_PERCPU_ARRAY | u32 (Index) \rightarrow struct syn_stats | Low-latency per-CPU array providing instant local metrics for volumetric SYN DDoS drop at Cycle 0 without cross-CPU lock contention or cache invalidation. |
 
 ---
 
@@ -257,27 +270,28 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or tim
 The architecture decouples timer management depending on the execution context and the application layer involved:
 
 ### 7.1. Time Field Semantics (`_ns`)
-* **`created_at_ns` (`map_handshake`):** Represents the absolute timestamp when OpenBSD issued the SYN-ACK packet. Used to calculate the handshake completion TTL (e.g., 3-5 seconds).
-* **`last_seen_ns` (`map_session`):** Represents the timestamp of the last valid packet transmitted on the Fast-Path by the authenticated client (updated with a maximum throttling rate of 1Hz). Determines the hard idle timeout and termination grace time.
-* **`until_when_ns` (`map_blacklist` and `map_ip_trespass`):** Represents the exact future timestamp until which every incoming packet from the client must be dropped.
+* **`created_at_ns` (`map_handshake`):** Absolute timestamp marking when OpenBSD issued the SYN-ACK packet. Used to enforce the handshake completion TTL (e.g., 3–5 seconds).
+* **`last_seen_ns` (`map_session`):** Timestamp of the last valid packet transmitted on the fast path by the authenticated client (updated at a maximum throttling rate of 1Hz). Determines the hard idle timeout and termination grace period.
+* **`until_when_ns` (`map_session_v4 / v6` and `map_mitigation_v4 / v6`):** Absolute future timestamp defining the active drop window. Every packet from the associated IP/tuple is dropped until $t_{\text{now}} > \text{until\_when\_ns}$.
 
 ### 7.2. Immediate L7 Penalties and Atomic Purging via UDP Teardown
-When the AI Security Gateway on OpenBSD detects a Layer 7 infraction (e.g., application attack, protocol violation, malicious payload):
-1. The application sends a UDP Teardown message to **BoxA:LAN** containing the client tuple and the penalty duration ($T_{infraction}$).
-2. XDP intercepts the message and executes a two-tiered atomic cleanup:
-   * Deletes the entry from **`map_session`** (if the session was promoted).
-   * Deletes the entry from **`map_unauth`**.
-   * Deletes the entry from **`map_handshake`**.
-3. Inserts the tuple into **`map_blacklist`** if the IP is not present in **`map_net_whitelist_dc`**, computing:
-   $$`until_when_ns` = `bpf_ktime_get_ns()` + T_{infraction}$$
-4. XDP drops the command UDP packet (`XDP_DROP`). The duration $T_{infraction}$ is dynamically modulated by the AI Security Gateway based on the severity of the L7 anomaly.
+When the AI Security Gateway detects a Layer 7 infraction (e.g., protocol violation, malicious payload, or application exploit):
+1. The application layer dispatches a local UDP Teardown message containing the client tuple and penalty duration ($T_{\text{infraction}}$).
+2. XDP intercepts the local teardown packet and purges the corresponding entry from `map_handshake` (if present).
+3. XDP checks `map_net_whitelist_dc_v4/v6`. If the client IP is not whitelisted, XDP sets the tuple's `until_when_ns` inside `map_session_v4 / v6`:
+   
+   $$\text{until\_when\_ns} = \text{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}$$
 
-### 7.3. Recidivism Logic and Cumulative Population in User-Space (`map_ip_trespass`)
-The `map_ip_trespass` map is populated and processed exclusively by the **User-Space Garbage Collector on Linux**:
-1. **Tracking and Event-Sourcing:** The daemon periodically inspects the **active bans present in `map_blacklist`**. Because L7 session entries are purged immediately upon termination, the daemon focuses strictly on the frequency and concurrency of L3/L4 infractions originating from the same source IP.
-2. **Cumulative Suspension Calculation:** If multiple or simultaneous infractions occur from the same IP within the observation window (e.g., multi-port attack attempts or aggressive reconnections), the daemon calculates a progressive time penalty:
-   $$T_{trespass} = \sum_{i=1}^{k} T_{infraction\_i} \times Factor_{recidiva}$$
-3. **Promotion to Trespass:** Upon exceeding the recidivism threshold, the daemon inserts the source host IP (`/32` or `/128`) into `map_ip_trespass` with an extended expiration timestamp (on the order of hours/days), blocking any handshake attempt before traffic can reach the blacklist check or the OpenBSD stack. In-depth forensic analysis and identity correlation remain strictly confined to the asynchronous audit logging pipeline.
+4. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
+
+### 7.3. Recidivism Logic and Cumulative Population (`map_mitigation_v4 / v6`)
+The `until_when_ns` field in `map_mitigation_v4 / v6` is updated and managed by the **User-Space Control Daemon**:
+1. **Event Inspection:** The daemon continuously reads active session penalties ($\text{until\_when\_ns} > 0$) across `map_session_v4 / v6` to track infraction frequency and concurrency per source host.
+2. **Cumulative Penalty Calculation:** When an IP accumulates multiple L3/L4 or L7 infractions within the observation window, the daemon calculates a progressive ban:
+
+   $$T_{\text{trespass}} = \left( \sum_{i=1}^{k} T_{\text{infraction\_i}} \right) \times \text{Factor}_{\text{recidiva}}$$
+
+3. **Escalation to Mitigation Map:** If $T_{\text{trespass}}$ crosses the recidivism threshold, the daemon writes the host IP (`/32` or `/128`) into `map_mitigation_v4 / v6` with an extended expiration timestamp ($\text{until\_when\_ns}$ spanning hours or days). This blocks subsequent TCP handshakes before traffic reaches the OpenBSD network stack.
 
 ---
 
@@ -286,23 +300,32 @@ The `map_ip_trespass` map is populated and processed exclusively by the **User-S
 Session memory cleanup and life-cycle management on BoxA are governed by a decoupled three-tiered protection mechanism:
 
 1. **Active Teardown via Internal UDP (L7 Penalty and Contextual Flush):** 
-   When the AI Security Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($T_{infraction}$). The XDP program intercepts the message and performs an atomic cleanup:
-   * Concurrently purges the entry from `map_session`, `map_unauth`, and `map_handshake`.
-   * Populates the penalty in `map_blacklist` by calculating the future expiration timestamp (`until_when_ns`).
-   * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
+   When the AI Security Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($T_{infraction}$). In the case of an IP-Level Teardown, it also sends an out-of-band notification to the Datacenter to insert the IP into RTBH. After ensuring the IP is not present in `map_net_whitelist_dc_v4 / v6`, the XDP program intercepts the message and performs an atomic cleanup:
+   * **Session-Level Teardown (Targeted Tuple Flush):**
+     * Deletes the entry from `map_handshake_v4 / v6` (if a tuple is still present).
+     * Populates the penalty in `map_session_v4 / v6` by calculating the future expiration timestamp (`until_when_ns`).
+     * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
+   * **IP-Level Teardown (Immediate Trespass & Multi-Session Flush):**
+      * Populates `until_when_ns` directly inside `map_mitigation_v4 / v6` with an extended penalty duration ($T_{trespass}$), bypassing user-space escalation cycles for immediate threat containment.
+      * Purges all active session entries associated with the client IP across `map_session_v4 / v6` and clears any pending records in `map_handshake_v4 / v6` (if a tuple is still present).
+     * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
 
 2. **In-Kernel TCP Teardown & State-Machine (`SESSION_CLOSING`):** 
    In compliance with RFC 793/9293, authenticated session closures are handled in real time directly on the XDP Fast-Path:
    * **Direct Forwarding (`RST`):** Incoming `RST` packets trigger immediate forwarding (`XDP_REDIRECT`) and instantaneous atomic deletion of the session from the BPF map (`bpf_map_delete_elem`).
    * **Phased `FIN` Closure:** Upon encountering the first `FIN` packet, the session state transitions to `SESSION_CLOSING`. Once the matching `FIN` from the opposite direction and the final confirming ACK pass through, XDP instantly purges the session from `map_session` and its corresponding entry in `map_blacklist` (if set with `until_when_ns == 0`), eliminating LAN UDP messaging overhead entirely.
-
+   
 3. **User-Space Garbage Collector (Linux Daemon on BoxA):** 
-   A User-Space daemon periodically scans and inspects the eBPF maps via the `bpf()` syscall as a failsafe mechanism to handle abnormal disconnects and timeouts:
-   * **In `map_handshake`:** Removes pending sessions whose creation time exceeds the completion TTL (3-5 seconds).
-   * **In `map_unauth`:** Purges pending authentication records whose creation timestamp exceeds the predefined threshold (60-120 seconds).
-   * **In `map_session` (Incomplete Teardowns / RFC Fallback):** Intervenes if a `FIN` teardown remains stuck in `SESSION_CLOSING` without receiving the final ACK (e.g., due to network packet loss), cleaning up the session and its blacklist entry upon expiration of a reduced *Grace-Timeout* (2-5 seconds). It also purges orphaned sessions exceeding the idle Hard Timeout based on `last_seen_ns`.
-   * **In `map_blacklist`:** Removes temporary bans whose `until_when_ns` timestamp has elapsed.
-   * **In `map_ip_trespass`:** Cleans up host entries whose cumulative suspension has expired or resets internal recidivism counters for rehabilitated hosts.
+   A user-space daemon periodically scans and inspects the eBPF maps via the `bpf()` system call as a failsafe mechanism to handle abnormal disconnects, edge-case timeouts, and session map hygiene:
+   * **In `map_handshake_v4 / v6`:** Removes pending handshake sessions whose creation time (`created_at_ns`) exceeds the completion TTL (3–5 seconds).
+   * **In `map_session_v4 / v6` (Incomplete Teardowns & RFC Fallback):**
+     * **Limbo Rules (`SESSION_GREETING`):** Purges pending authentication records whose timestamp exceeds the predefined session threshold plus the Garbage Collector Grace-Timeout (60–120 seconds + 5–10 seconds Grace-Timeout).
+     * **`SESSION_CLOSING`:** Intervenes if a `FIN` teardown remains stuck without receiving the final `ACK` (e.g., due to packet loss), cleaning up the session and its transient drop rule upon expiration of a reduced Grace-Timeout (2–5 seconds). It also purges orphaned sessions exceeding the idle hard timeout based on `last_seen_ns`.
+     * **Active / Expired State Rules:** Cleans up session entries based on their operational context:
+       * **Active Session Shields (`until_when_ns == 0`):** Retained indefinitely for the active duration of the connection; cleaned up exclusively upon TCP session termination (`FIN`/`RST`), or `last_seen_ns` hard timeout expiration.
+     * **Punitive / Hard Bans ($0 < \text{until\_when\_ns} < \text{UINT64\_MAX}$):** Removes temporary session penalties only after their expiration timestamp (`until_when_ns`) has completely elapsed plus the required Grace-Timeout ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$).
+   * **In `map_mitigation_v4 / v6` (Zero GC Overhead):** 
+     * **No active GC deletion sweeps.** Memory reclamation and host eviction are handled entirely in-kernel via the `BPF_MAP_TYPE_LRU_HASH` native replacement policy when capacity is reached. Expired bans ($t_{\text{current}} > \text{until\_when\_ns}$) auto-pass in XDP fast path without requiring user-space map mutations.
 
 ---
 
@@ -392,4 +415,4 @@ For commercial licensing, enterprise deployment rights, proprietary integrations
 * **Email:** [workwheat09@gmail.com](mailto:workwheat09@gmail.com)
 
 ---
-*Extended security modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).*
+*Extended security modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).* modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).**
