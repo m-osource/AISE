@@ -8,18 +8,24 @@ On the external interface **BoxA:WAN**, in addition to the usual header field va
 
 * **RTBH / FIB Reverse Lookup (Zero Maps):** XDP performs a Reverse Route Lookup via the helper function `bpf_fib_lookup()`, checking the route for the packet's source IP. If the source IP falls within a prefix advertised via BGP as `blackhole` or `unreachable`, the packet is instantly dropped (`XDP_DROP`).
 * **Volumetric SYN-Flood Mitigation (`map_cpu_syn_stats`):** To shield the OpenBSD Gateway (**Box B**) from state-table saturation under volumetric L4 SYN-floods, **Box A** executes an early-stage probabilistic **Per-CPU Lockless Filter** at **Cycle 0** (XDP driver layer).
-  * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta ($\Delta t = t_{\text{now}} - t_{\text{last\_seen}}$) without atomic operations.
-  * **User-Space Dynamic Scaling:** The User-Space Control Daemon (C++) calculates the per-CPU inter-arrival threshold ($\Delta t_{\text{min\_cpu}}$) based on OpenBSD’s target capacity ($R_{\text{max}}$) and active NIC RSS queues ($N_{\text{cpu}}$):
-    $$\Delta t_{\text{min\_cpu}} = \frac{1.000.000.000 \times N_{\text{cpu}}}{R_{\text{max}}}$$
-  * **Instantaneous Enforcement:** Thresholds are injected into eBPF `.rodata` at loader boot. If $\Delta t < \Delta t_{\text{min\_cpu}}$, an in-register pseudo-random discriminator probabilistically drops packet bursts at Cycle 0, delivering a clean, rate-capped SYN stream to OpenBSD.
+  * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta <i>&Delta;t</i> = <i>t</i><sub>now</sub> - <i>t</i><sub>last\_seen</sub> without atomic operations.
+  * **User-Space Dynamic Scaling:** The User-Space Control Daemon (C++) calculates the per-CPU inter-arrival threshold <i>&Delta;t</i><sub>min\_cpu</sub> based on OpenBSD’s target capacity <i>R</i><sub>max</sub> and active NIC RSS queues <i>N</i><sub>cpu</sub>:
+
+<div align="center">
+
+\$`\Delta t_{\mathrm{min\_cpu}} = \frac{1.000.000.000 \times N_{\mathrm{cpu}}}{R_{\mathrm{max}}}`\$
+
+</div>
+
+* **Instantaneous Enforcement:** Thresholds are injected into eBPF `.rodata` at loader boot. If <i>&Delta;t</i> &lt; <i>&Delta;t</i><sub>min\_cpu</sub>, an in-register pseudo-random discriminator probabilistically drops packet bursts at Cycle 0, delivering a clean, rate-capped SYN stream to OpenBSD.
 * **Tuple SYN Protection & DoS Mitigation Logic:** Incoming `SYN` packets are evaluated against `map_session_v4 / v6` using the client tuple/IP. The `until_when_ns` field serves as the single source of truth for both traffic enforcement and record lifecycle.
   * **Permanent Blacklist (`until_when_ns == 0`):** If the tuple exists with `until_when_ns == 0`, the `SYN` packet is unconditionally dropped (`XDP_DROP`).
   * **Timed Blacklist (`until_when_ns > 0`):** 
-    * **Active / Unexpired ($t_{\text{current}} < t_{\text{until\_when\_ns}}$):** The `SYN` packet is dropped (`XDP_DROP`). The WAN Garbage Collector is strictly prohibited from deleting the entry while the timestamp plus the Grace-Timeout ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$) remains in the future.
-    * **Expired ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$):** XDP deletes the record from the map. Once removed, subsequent `SYN` packets matching this tuple pass the check and undergo `XDP_REDIRECT` toward the processing pipeline.
+    * **Active / Unexpired (<i>t</i><sub>current</sub> &lt; <i>t</i><sub>until\_when\_ns</sub>):** The `SYN` packet is dropped (`XDP_DROP`). The WAN Garbage Collector is strictly prohibited from deleting the entry while the timestamp plus the Grace-Timeout (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout) remains in the future.
+    * **Expired (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout):** XDP deletes the record from the map. Once removed, subsequent `SYN` packets matching this tuple pass the check and undergo `XDP_REDIRECT` toward the processing pipeline.
 * **Individual Host IPs (`/32` or `/128`) anomalies mitigation (`map_mitigation_v4 / v6`) and Data Center Whitelist:**
-  After consulted the Administrative/Data Center Whitelist LPM Trie map (`ip_whitelist_dc_v4 / v6`) to ensure that administrative address are not included, performs:
-  * **Hostile Host Filter:** Direct-access HASH control blocked administratively/cumulatively ($t_{\text{current}} < t_{\text{until\_when\_ns}}$) for a short time (hours/days) until the address is handled by BGP/RTBH layer. CIDR networks are delegated entirely to the BGP/RTBH layer.
+  After consulted the Administrative/Data Center Whitelist LPM Trie map (`ip_whitelist_dc_v4 / v6`) to ensure that administrative address are not included, performs: 
+  * **Hostile Host Filter:** Direct-access HASH control blocked administratively/cumulatively  (<i>t</i><sub>current</sub> &lt; <i>t</i><sub>until\_when\_ns</sub>) for a short time (hours/days) until the address is handled by BGP/RTBH layer. CIDR networks are delegated entirely to the BGP/RTBH layer.
   * **Stateless Dynamic Handshake Throttling:** To prevent socket exhaustion on OpenBSD and limit simultaneous or brute-force TCP handshake attacks from single IPs, XDP applies a **Token Bucket / Leaky Bucket** algorithm on the `pending_handshake_count` counter:
     * **Burst Capacity & Ordinary State (`pending_handshake_count < B_MAX`):** Allows an instantaneous burst of concurrent negotiations (e.g., $B_{MAX} = 10 \div 30$) from the same source IP. This prevents *Self-DoS* of legitimate clients behind the same NAT/corporate router following reboots or line failovers. SYN packets are forwarded at line rate (`XDP_REDIRECT`).
     * **Leaky Rate & Fast-Clear:** The handshake counter is refilled at a strict background rate (e.g., 30/minute) to constrain unauthenticated probes. As soon as the **Auth Verifier** (Control Plane) validates the connection and issues an `AUTH_OK` state promotion (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`), the consumed token is **immediately refunded to the source IP's quota (*Fast-Clear*)**, allowing legitimate users to establish concurrent authenticated sessions without rate-limiting friction.
@@ -216,7 +222,7 @@ The atomic promotion cycle progresses through three sequential phases:
    Only following an `AUTH_UN` confirmation and subsequent application/TLS credential validation does the Auth Verifier Daemon transmit an `AUTH_OK` UDP packet toward the **BoxA:LAN** interface:
    * **Silent Interception:** XDP intercepts the `AUTH_OK` packet and silently consumes it (`XDP_DROP`).
    * **Atomic Promotion (`SESSION_ACTIVE`):** On Cache-Line 1 the `SESSION_GREETING` status is promoted to Fast-Path (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`). On the WAN side while XDP is in `SESSION_GREETING` on Cache-Line 0 when receives a valid TCP ACK it always looks for `SESSION_ACTIVE` on Cache-Line 1 to promote the status on its Cache-Line.
-  * **SYN Protection / DoS Mitigation (BoxA:WAN):** The presence of an unexpired tuple in `map_session_v4 / v6` enforces immediate SYN-Flood protection at the WAN interface. Any incoming `SYN` matching an active block (`until_when_ns == 0` or $t_{\text{current}} < t_{\text{until\_when\_ns}}$) is dropped unconditionally (`XDP_DROP`) before state allocation or resource consumption can occur.
+  * **SYN Protection / DoS Mitigation (BoxA:WAN):** The presence of an unexpired tuple in `map_session_v4 / v6` enforces immediate SYN-Flood protection at the WAN interface. Any incoming `SYN` matching an active block (`until_when_ns == 0` or <i>t</i><sub>current</sub> &lt; <i>t</i><sub>until\_when\_ns</sub>) is dropped unconditionally (`XDP_DROP`) before state allocation or resource consumption can occur.
   * **Established Session Interception:** Any ongoing session traffic (including `ACK`, `PSH`, or `FIN` in either direction) matching an unexpired `until_when_ns` timestamp is dropped instantly at Layer 0 (`XDP_DROP`), cutting off active streams without processing payload or updating session state.
    * **Counter Update:** It atomically decrements (`__sync_fetch_and_sub`) the `pending_handshake_count` metric on **`map_pending_handshake`**.
    * **Line-Rate Forwarding:** From this moment forward, session traffic travels at line-rate on the Fast-Path WAN $\rightarrow$ LAN pipeline, protected by TCP window consistency checks.
@@ -245,7 +251,7 @@ The atomic promotion cycle progresses through three sequential phases:
 
 Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or policy enforcement):
 1. XDP extracts the target tuple `(Client_IP, Client_Port)` from the control payload.
-2. It performs an atomic lookup/update on **`map_session_v4 / v6`** to transition the session state to blacklisted by setting `until_when_ns` (**`map_ip_trespass`** if the host is a repeat offender or $t_{\text{current}} + \text{duration\_ns}$ for timed eviction).
+2. It performs an atomic lookup/update on **`map_session_v4 / v6`** to transition the session state to blacklisted by setting `until_when_ns` (**`map_ip_trespass`** if the host is a repeat offender or <i>t</i><sub>current</sub> + <i>t</i><sub>duration\_ns</sub> for timed eviction).
 3. **Atomic State & Counter Management (Single Source of Truth):**
    * **If session is active/pending:** XDP updates `until_when_ns` to enforce immediate bidirectional dropping (`XDP_DROP`). If the session was still in the handshake phase, it atomically decrements `pending_handshake_count` on **`map_pending_handshake`**.
    * **If entry is already blacklisted or absent:** If `until_when_ns` is already active or the entry was previously cleaned up, XDP aborts execution without modifying global counters, mathematically eliminating any risk of a *double-decrement*.
