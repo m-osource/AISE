@@ -264,10 +264,10 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or pol
 | Map / Table | BPF Type | Architecture & Operational Purpose | Eviction & Lifecycle |
 | :--- | :--- | :--- | :--- |
 | **`map_handshake`** | `BPF_MAP_TYPE_LRU_HASH` | Temporary TCP completion tracking (SYN-ACK $\rightarrow$ ACK). | Fast expiration (3–5s) or cleanup via garbage collector. |
-​| map_session | BPF_MAP_TYPE_HASH | Unified session & dynamic blacklist table using until_when_ns enforcement. | Updated on AUTH_OK/TEARDOWN; cleared by user-space GC, expired until_when_ns, or inline cleanup. |
+| **`map_session`** | `BPF_MAP_TYPE_HASH` | Unified session & dynamic blacklist table using until_when_ns enforcement. | Updated on AUTH_OK/TEARDOWN; cleared by user-space GC, expired until_when_ns, or inline cleanup. |
 | **`map_net_whitelist_dc`** | `BPF_MAP_TYPE_LPM_TRIE` | Data center network address and CIDR map. | Updated via User Space program. |
 | **`map_mitigation`** | `BPF_MAP_TYPE_LRU_HASH` | `Client_IP` → `struct mitigation_value` | Unified IP tracking for transient trespass escalation, token-bucket SYN rate-limiting, and pending handshakes. Enforces dynamic local bans to bridge traffic until upstream RTBH propagation takes effect. |
-| map_cpu_syn_stats | BPF_MAP_TYPE_PERCPU_ARRAY | u32 (Index) \rightarrow struct syn_stats | Low-latency per-CPU array providing instant local metrics for volumetric SYN DDoS drop at Cycle 0 without cross-CPU lock contention or cache invalidation. |
+| **`map_cpu_syn_stats`** | `BPF_MAP_TYPE_PERCPU_ARRAY` | `u32 (Index)` → `struct syn_stats` | Low-latency per-CPU array providing instant local metrics for volumetric SYN DDoS drop at Cycle 0 without cross-CPU lock contention or cache invalidation. |
 
 ---
 
