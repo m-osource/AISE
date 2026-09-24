@@ -8,7 +8,7 @@ On the external interface **BoxA:WAN**, in addition to the usual header field va
 
 * **RTBH / FIB Reverse Lookup (Zero Maps):** XDP performs a Reverse Route Lookup via the helper function `bpf_fib_lookup()`, checking the route for the packet's source IP. If the source IP falls within a prefix advertised via BGP as `blackhole` or `unreachable`, the packet is instantly dropped (`XDP_DROP`).
 * **Volumetric SYN-Flood Mitigation (`map_cpu_syn_stats`):** To shield the OpenBSD Gateway (**Box B**) from state-table saturation under volumetric L4 SYN-floods, **Box A** executes an early-stage probabilistic **Per-CPU Lockless Filter** at **Cycle 0** (XDP driver layer).
-  * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta <i>&Delta;t</i> = <i>t</i><sub>now</sub> - <i>t</i><sub>last\_seen</sub> without atomic operations.
+  * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta <i>&Delta;t</i> = <i>t</i><sub>current</sub> - <i>t</i><sub>last\_seen</sub> without atomic operations.
   * **User-Space Dynamic Scaling:** The User-Space Control Daemon (C++) calculates the per-CPU inter-arrival threshold <i>&Delta;t</i><sub>min\_cpu</sub> based on OpenBSD’s target capacity <i>R</i><sub>max</sub> and active NIC RSS queues <i>N</i><sub>cpu</sub>:
 
 <div align="center">
@@ -288,26 +288,24 @@ When the AI Security Gateway detects a Layer 7 infraction (e.g., protocol violat
 
 <div align="center">
 
-\$`\mathrm{until\_when\_ns} = \mathrm{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}`\$
+\$`\mathrm{until\_when\_ns} = \mathrm{bpf\_ktime\_get\_ns}() + t_{\text{infraction}}`\$
 
 </div>
 
-5. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
+4. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
 
 ### 7.3. Recidivism Logic and Cumulative Population (`map_mitigation_v4 / v6`)
 The `until_when_ns` field in `map_mitigation_v4 / v6` is updated and managed by the **User-Space Control Daemon**:
 1. **Event Inspection:** The daemon continuously reads active session penalties (\$`\mathrm{until\_when\_ns} > 0`\$) across `map_session_v4 / v6` to track infraction frequency and concurrency per source host.
 2. **Cumulative Penalty Calculation:** When an IP accumulates multiple L3/L4 or L7 infractions within the observation window, the daemon calculates a progressive ban:
-
-   $$T_{\text{trespass}} = \left( \sum_{i=1}^{k} T_{\text{infraction\_i}} \right) \times \text{Factor}_{\text{recidiva}}$$
+  
 <div align="center">
 
-\$`T_{\text{trespass}} = \mathrm{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}`\$
+$$t_{\text{trespass}} = \left( \sum_{i=1}^{k} \mathrm{infraction\_i} \right) \times \text{Factor}_{\text{recidiva}}$$
 
-</div
- >
+</div>
 
-4. **Escalation to Mitigation Map:** If $T_{\text{trespass}}$ crosses the recidivism threshold, the daemon writes the host IP (`/32` or `/128`) into `map_mitigation_v4 / v6` with an extended expiration timestamp ($\text{until\_when\_ns}$ spanning hours or days). This blocks subsequent TCP handshakes before traffic reaches the OpenBSD network stack.
+4. **Escalation to Mitigation Map:** If $t_{\text{trespass}}$ crosses the recidivism threshold, the daemon writes the host IP (`/32` or `/128`) into `map_mitigation_v4 / v6` with an extended expiration timestamp (`until_when_ns` spanning hours or days). This blocks subsequent TCP handshakes before traffic reaches the OpenBSD network stack.
 
 ---
 
@@ -339,9 +337,9 @@ Session memory cleanup and life-cycle management on BoxA are governed by a decou
      * **`SESSION_CLOSING`:** Intervenes if a `FIN` teardown remains stuck without receiving the final `ACK` (e.g., due to packet loss), cleaning up the session and its transient drop rule upon expiration of a reduced Grace-Timeout (2–5 seconds). It also purges orphaned sessions exceeding the idle hard timeout based on `last_seen_ns`.
      * **Active / Expired State Rules:** Cleans up session entries based on their operational context:
        * **Active Session Shields (`until_when_ns == 0`):** Retained indefinitely for the active duration of the connection; cleaned up exclusively upon TCP session termination (`FIN`/`RST`), or `last_seen_ns` hard timeout expiration.
-     * **Punitive / Hard Bans ($0 < \text{until\_when\_ns} < \text{UINT64\_MAX}$):** Removes temporary session penalties only after their expiration timestamp (`until_when_ns`) has completely elapsed plus the required Grace-Timeout ($t_{\text{current}} \ge \text{until\_when\_ns} + \text{Grace\_Timeout}$).
+     * **Punitive / Hard Bans (\$`0 < \mathrm{until\_when\_ns} < \mathrm{UINT64\_MAX}`\$):** Removes temporary session penalties only after their expiration timestamp (`until_when_ns`) has completely elapsed plus the required Grace-Timeout (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout).
    * **In `map_mitigation_v4 / v6` (Zero GC Overhead):** 
-     * **No active GC deletion sweeps.** Memory reclamation and host eviction are handled entirely in-kernel via the `BPF_MAP_TYPE_LRU_HASH` native replacement policy when capacity is reached. Expired bans ($t_{\text{current}} > \text{until\_when\_ns}$) auto-pass in XDP fast path without requiring user-space map mutations.
+     * **No active GC deletion sweeps.** Memory reclamation and host eviction are handled entirely in-kernel via the `BPF_MAP_TYPE_LRU_HASH` native replacement policy when capacity is reached. Expired bans (<i>t</i><sub>current</sub> &gt; until\_when\_ns) auto-pass in XDP fast path without requiring user-space map mutations.
 
 ---
 
