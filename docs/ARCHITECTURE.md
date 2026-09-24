@@ -25,7 +25,7 @@ On the external interface **BoxA:WAN**, in addition to the usual header field va
     * **Expired (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout):** XDP deletes the record from the map. Once removed, subsequent `SYN` packets matching this tuple pass the check and undergo `XDP_REDIRECT` toward the processing pipeline.
 * **Individual Host IPs (`/32` or `/128`) anomalies mitigation (`map_mitigation_v4 / v6`) and Data Center Whitelist:**
   After consulted the Administrative/Data Center Whitelist LPM Trie map (`ip_whitelist_dc_v4 / v6`) to ensure that administrative address are not included, performs: 
-  * **Hostile Host Filter:** Direct-access HASH control blocked administratively/cumulatively  (<i>t</i><sub>current</sub> &lt; <i>t</i><sub>until\_when\_ns</sub>) for a short time (hours/days) until the address is handled by BGP/RTBH layer. CIDR networks are delegated entirely to the BGP/RTBH layer.
+  * **Hostile Host Filter:** Direct-access HASH control blocked administratively/cumulatively  (<i>t</i><sub>current</sub> &lt; until\_when\_ns) for a short time (hours/days) until the address is handled by BGP/RTBH layer. CIDR networks are delegated entirely to the BGP/RTBH layer.
   * **Stateless Dynamic Handshake Throttling:** To prevent socket exhaustion on OpenBSD and limit simultaneous or brute-force TCP handshake attacks from single IPs, XDP applies a **Token Bucket / Leaky Bucket** algorithm on the `pending_handshake_count` counter:
     * **Burst Capacity & Ordinary State (`pending_handshake_count < B_MAX`):** Allows an instantaneous burst of concurrent negotiations (e.g., $B_{MAX} = 10 \div 30$) from the same source IP. This prevents *Self-DoS* of legitimate clients behind the same NAT/corporate router following reboots or line failovers. SYN packets are forwarded at line rate (`XDP_REDIRECT`).
     * **Leaky Rate & Fast-Clear:** The handshake counter is refilled at a strict background rate (e.g., 30/minute) to constrain unauthenticated probes. As soon as the **Auth Verifier** (Control Plane) validates the connection and issues an `AUTH_OK` state promotion (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`), the consumed token is **immediately refunded to the source IP's quota (*Fast-Clear*)**, allowing legitimate users to establish concurrent authenticated sessions without rate-limiting friction.
@@ -278,26 +278,36 @@ The architecture decouples timer management depending on the execution context a
 ### 7.1. Time Field Semantics (`_ns`)
 * **`created_at_ns` (`map_handshake`):** Absolute timestamp marking when OpenBSD issued the SYN-ACK packet. Used to enforce the handshake completion TTL (e.g., 3–5 seconds).
 * **`last_seen_ns` (`map_session`):** Timestamp of the last valid packet transmitted on the fast path by the authenticated client (updated at a maximum throttling rate of 1Hz). Determines the hard idle timeout and termination grace period.
-* **`until_when_ns` (`map_session_v4 / v6` and `map_mitigation_v4 / v6`):** Absolute future timestamp defining the active drop window. Every packet from the associated IP/tuple is dropped until $t_{\text{now}} > \text{until\_when\_ns}$.
+* **`until_when_ns` (`map_session_v4 / v6` and `map_mitigation_v4 / v6`):** Absolute future timestamp defining the active drop window. Every packet from the associated IP/tuple is dropped until <i>t</i><sub>current</sub> &gt; `until\_when\_ns`.
 
 ### 7.2. Immediate L7 Penalties and Atomic Purging via UDP Teardown
 When the AI Security Gateway detects a Layer 7 infraction (e.g., protocol violation, malicious payload, or application exploit):
 1. The application layer dispatches a local UDP Teardown message containing the client tuple and penalty duration ($T_{\text{infraction}}$).
 2. XDP intercepts the local teardown packet and purges the corresponding entry from `map_handshake` (if present).
 3. XDP checks `map_net_whitelist_dc_v4/v6`. If the client IP is not whitelisted, XDP sets the tuple's `until_when_ns` inside `map_session_v4 / v6`:
-   
-   $$\text{until\_when\_ns} = \text{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}$$
 
-4. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
+<div align="center">
+
+\$`\mathrm{until\_when\_ns} = \mathrm{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}`\$
+
+</div>
+
+5. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
 
 ### 7.3. Recidivism Logic and Cumulative Population (`map_mitigation_v4 / v6`)
 The `until_when_ns` field in `map_mitigation_v4 / v6` is updated and managed by the **User-Space Control Daemon**:
-1. **Event Inspection:** The daemon continuously reads active session penalties ($\text{until\_when\_ns} > 0$) across `map_session_v4 / v6` to track infraction frequency and concurrency per source host.
+1. **Event Inspection:** The daemon continuously reads active session penalties (\$`\mathrm{until\_when\_ns} > 0`\$) across `map_session_v4 / v6` to track infraction frequency and concurrency per source host.
 2. **Cumulative Penalty Calculation:** When an IP accumulates multiple L3/L4 or L7 infractions within the observation window, the daemon calculates a progressive ban:
 
    $$T_{\text{trespass}} = \left( \sum_{i=1}^{k} T_{\text{infraction\_i}} \right) \times \text{Factor}_{\text{recidiva}}$$
+<div align="center">
 
-3. **Escalation to Mitigation Map:** If $T_{\text{trespass}}$ crosses the recidivism threshold, the daemon writes the host IP (`/32` or `/128`) into `map_mitigation_v4 / v6` with an extended expiration timestamp ($\text{until\_when\_ns}$ spanning hours or days). This blocks subsequent TCP handshakes before traffic reaches the OpenBSD network stack.
+\$`T_{\text{trespass}} = \mathrm{bpf\_ktime\_get\_ns}() + T_{\text{infraction}}`\$
+
+</div
+ >
+
+4. **Escalation to Mitigation Map:** If $T_{\text{trespass}}$ crosses the recidivism threshold, the daemon writes the host IP (`/32` or `/128`) into `map_mitigation_v4 / v6` with an extended expiration timestamp ($\text{until\_when\_ns}$ spanning hours or days). This blocks subsequent TCP handshakes before traffic reaches the OpenBSD network stack.
 
 ---
 
