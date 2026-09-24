@@ -231,7 +231,13 @@ The atomic promotion cycle progresses through three sequential phases:
 
 * **Rate-Limiting Exemption for Authenticated Clients:** Clients present in `map_session` travel at full line-rate without undergoing frequency checks or token counting, ensuring maximum throughput.
 * **In-Window Validation on XDP (RFC 793):** Every incoming data/ACK packet must comply with the TCP window acceptability rule:
-  $$SEG.SEQ \ge Expected \quad AND \quad SEG.SEQ < Expected + Window\_Size$$
+
+<div align="center">
+ 
+  \$`SEG.SEQ \ge \text{Expected} \quad \text{AND} \quad SEG.SEQ < \text{Expected} + \mathrm{Window\_Size}`\$
+
+</div>
+  
   Packets falling outside this range are dropped at ingress (`XDP_DROP`), protecting OpenBSD from out-of-window ACK Flood attacks.
 * **Resilience to Blind Sequence Attacks:** If an attacker sends packets with randomized sequence numbers spoofing an active client, XDP drops them on the first CPU cycle. The client's entry in `map_session` **remains unaltered and unpurged**, safeguarding legitimate connections from forced disconnections.
 * **Resilience to Slowloris Attacks and Sandbox Isolation:** 
