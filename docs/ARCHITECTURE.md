@@ -314,13 +314,13 @@ $$t_{\text{trespass}} = \left( \sum_{i=1}^{k} \mathrm{infraction\_i} \right) \ti
 Session memory cleanup and life-cycle management on BoxA are governed by a decoupled three-tiered protection mechanism:
 
 1. **Active Teardown via Internal UDP (L7 Penalty and Contextual Flush):** 
-   When the AI Security Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($T_{infraction}$). In the case of an IP-Level Teardown, it also sends an out-of-band notification to the Datacenter to insert the IP into RTBH. After ensuring the IP is not present in `map_net_whitelist_dc_v4 / v6`, the XDP program intercepts the message and performs an atomic cleanup:
+   When the AI Security Gateway application on OpenBSD detects a Layer 7 infraction or requests the immediate termination of a client, it transmits a control UDP packet to **BoxA:LAN** containing the session tuple and penalty duration ($t_{infraction}$). In the case of an IP-Level Teardown, it also sends an out-of-band notification to the Datacenter to insert the IP into RTBH. After ensuring the IP is not present in `map_net_whitelist_dc_v4 / v6`, the XDP program intercepts the message and performs an atomic cleanup:
    * **Session-Level Teardown (Targeted Tuple Flush):**
      * Deletes the entry from `map_handshake_v4 / v6` (if a tuple is still present).
      * Populates the penalty in `map_session_v4 / v6` by calculating the future expiration timestamp (`until_when_ns`).
      * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
    * **IP-Level Teardown (Immediate Trespass & Multi-Session Flush):**
-      * Populates `until_when_ns` directly inside `map_mitigation_v4 / v6` with an extended penalty duration ($T_{trespass}$), bypassing user-space escalation cycles for immediate threat containment.
+      * Populates `until_when_ns` directly inside `map_mitigation_v4 / v6` with an extended penalty duration ($t_{trespass}$), bypassing user-space escalation cycles for immediate threat containment.
       * Purges all active session entries associated with the client IP across `map_session_v4 / v6` and clears any pending records in `map_handshake_v4 / v6` (if a tuple is still present).
      * Drops the command packet (`XDP_DROP`) to prevent it from traversing the Linux network stack.
 
@@ -337,7 +337,7 @@ Session memory cleanup and life-cycle management on BoxA are governed by a decou
      * **`SESSION_CLOSING`:** Intervenes if a `FIN` teardown remains stuck without receiving the final `ACK` (e.g., due to packet loss), cleaning up the session and its transient drop rule upon expiration of a reduced Grace-Timeout (2–5 seconds). It also purges orphaned sessions exceeding the idle hard timeout based on `last_seen_ns`.
      * **Active / Expired State Rules:** Cleans up session entries based on their operational context:
        * **Active Session Shields (`until_when_ns == 0`):** Retained indefinitely for the active duration of the connection; cleaned up exclusively upon TCP session termination (`FIN`/`RST`), or `last_seen_ns` hard timeout expiration.
-     * **Punitive / Hard Bans (\$`0 < \mathrm{until\_when\_ns} < \mathrm{UINT64\_MAX}`\$):** Removes temporary session penalties only after their expiration timestamp (`until_when_ns`) has completely elapsed plus the required Grace-Timeout (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout).
+     * **Punitive / Hard Bans (`0 < until\_when\_ns < UINT64\_MAX`):** Removes temporary session penalties only after their expiration timestamp (`until_when_ns`) has completely elapsed plus the required Grace-Timeout (<i>t</i><sub>current</sub> &ge; until\_when\_ns + Grace\_Timeout).
    * **In `map_mitigation_v4 / v6` (Zero GC Overhead):** 
      * **No active GC deletion sweeps.** Memory reclamation and host eviction are handled entirely in-kernel via the `BPF_MAP_TYPE_LRU_HASH` native replacement policy when capacity is reached. Expired bans (<i>t</i><sub>current</sub> &gt; until\_when\_ns) auto-pass in XDP fast path without requiring user-space map mutations.
 
