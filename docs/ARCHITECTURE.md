@@ -232,13 +232,13 @@ The atomic promotion cycle progresses through three sequential phases:
 * **Rate-Limiting Exemption for Authenticated Clients:** Clients present in `map_session` travel at full line-rate without undergoing frequency checks or token counting, ensuring maximum throughput.
 * **In-Window Validation on XDP (RFC 793):** Every incoming data/ACK packet must comply with the TCP window acceptability rule:
 
-<div align="center">
+  <div align="center">
  
-  \$`SEG.SEQ \ge \text{Expected} \quad \text{AND} \quad SEG.SEQ < \text{Expected} + \mathrm{Window\_Size}`\$
+    \$`SEG.SEQ \ge \text{Expected} \quad \text{AND} \quad SEG.SEQ < \text{Expected} + \mathrm{Window\_Size}`\$
 
-</div>
+  </div>
   
-  Packets falling outside this range are dropped at ingress (`XDP_DROP`), protecting OpenBSD from out-of-window ACK Flood attacks.
+    Packets falling outside this range are dropped at ingress (`XDP_DROP`), protecting OpenBSD from out-of-window ACK Flood attacks.
 * **Resilience to Blind Sequence Attacks:** If an attacker sends packets with randomized sequence numbers spoofing an active client, XDP drops them on the first CPU cycle. The client's entry in `map_session` **remains unaltered and unpurged**, safeguarding legitimate connections from forced disconnections.
 * **Resilience to Slowloris Attacks and Sandbox Isolation:** 
   * **TLS Failure Tarpit (AI Security Gateway):** If the TLS/mTLS negotiation fails prior to authentication, the AI Security Gateway closes the socket by issuing a `TCP RST`. XDP on **BoxA:LAN** intercepts the `TCP RST`, purges the session from `map_unauth`, decrements `pending_handshake_count`, and executes a **silent `XDP_DROP` of the `TCP RST`** toward the WAN. The attacker remains stalled waiting for a timeout (Tarpit), while OpenBSD and Box A have already cleared their local state.
