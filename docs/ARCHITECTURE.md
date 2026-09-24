@@ -227,6 +227,8 @@ The atomic promotion cycle progresses through three sequential phases:
    * **Counter Update:** It atomically decrements (`__sync_fetch_and_sub`) the `pending_handshake_count` metric on **`map_pending_handshake`**.
    * **Line-Rate Forwarding:** From this moment forward, session traffic travels at line-rate on the Fast-Path WAN $\rightarrow$ LAN pipeline, protected by TCP window consistency checks.
 
+---
+
 ### 5.1. Fast-Path Specifications, UDP-Driven Teardown, and Race Condition Mitigation
 
 * **Rate-Limiting Exemption for Authenticated Clients:** Clients present in `map_session` travel at full line-rate without undergoing frequency checks or token counting, ensuring maximum throughput.
@@ -252,6 +254,8 @@ The atomic promotion cycle progresses through three sequential phases:
     * **Phased `FIN` Termination (`SESSION_CLOSING`):** Upon the passage of the first `FIN` packet (from either direction, LAN or WAN), the session state on that specific Cache Line transitions from `SESSION_ACTIVE` to `SESSION_CLOSING`.
       * **Instant Purge on ACK (RFC 793/9293 Compliance):** The simultaneous presence of `SESSION_CLOSING` on both Cache Lines attests to the completion of the bidirectional 4-way teardown handshake in full compliance with TCP standards. This authorizes either XDP pipeline/process (LAN or WAN) to instantly purge the session from the BPF map (`bpf_map_delete_elem`) upon receiving the subsequent `ACK` packet.
       * **Garbage Collector Fallback:** Should teardown fail to complete with the final ACK (e.g., due to packet loss), even a single-sided `SESSION_CLOSING` state enables the Garbage Collector to reclaim the session and its blacklist entry upon the expiration of a reduced *Grace-Timeout* (2–5s).
+
+---
 
 ### 5.2. Sanctions and Immediate Termination (`TEARDOWN`)
 
@@ -281,10 +285,14 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or pol
 
 The architecture decouples timer management depending on the execution context and the application layer involved:
 
+---
+
 ### 7.1. Time Field Semantics (`_ns`)
 * **`created_at_ns` (`map_handshake`):** Absolute timestamp marking when OpenBSD issued the SYN-ACK packet. Used to enforce the handshake completion TTL (e.g., 3–5 seconds).
 * **`last_seen_ns` (`map_session`):** Timestamp of the last valid packet transmitted on the fast path by the authenticated client (updated at a maximum throttling rate of 1Hz). Determines the hard idle timeout and termination grace period.
 * **`until_when_ns` (`map_session_v4 / v6` and `map_mitigation_v4 / v6`):** Absolute future timestamp defining the active drop window. Every packet from the associated IP/tuple is dropped until <i>t</i><sub>current</sub> &gt; `until\_when\_ns`.
+
+---
 
 ### 7.2. Immediate L7 Penalties and Atomic Purging via UDP Teardown
 When the AI Security Gateway detects a Layer 7 infraction (e.g., protocol violation, malicious payload, or application exploit):
@@ -299,6 +307,8 @@ When the AI Security Gateway detects a Layer 7 infraction (e.g., protocol violat
 </div>
 
 4. XDP drops the local control packet (`XDP_DROP`). The duration $T_{\text{infraction}}$ is dynamically set based on the L7 anomaly score.
+
+---
 
 ### 7.3. Recidivism Logic and Cumulative Population (`map_mitigation_v4 / v6`)
 The `until_when_ns` field in `map_mitigation_v4 / v6` is updated and managed by the **User-Space Control Daemon**:
