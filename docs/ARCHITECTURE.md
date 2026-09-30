@@ -82,10 +82,11 @@ Session management begins on the **BoxA:WAN** interface with handshake validatio
 4. **Hardened Anchor and Existence Probe (`AUTH_CK` / `AUTH_UN`) (BoxA:LAN):**
    * Before processing or attempting to verify any credentials (username/password/mTLS), the Auth Verifier Daemon sends a UDP `AUTH_CK` packet to XDP specifying the tuple extracted from the socket, to ensure that a regular Pre-Authentication (`SESSION_GREETING`) phase is actually in progress for that tuple, confirmed by the presence of the record and the receipt of `AUTH_UN`.
    * **Out-of-Band Communication and Stateless Nature (UDP Only):** The Auth Verifier operates exclusively on an asynchronous UDP channel in completely *stateless* mode. It does not retain session state in memory: once the single verification is complete, it instantly frees all local resources.
-   * **Atomic Anti-Replay and Self-Purge Check (`auth_ck_count`):** Each entry in `map_session_v4 / v6` includes an 8-bit atomic counter field (`auth_ck_count`). Upon receiving the `AUTH_CK` packet:
-     * **Tuple Missing (`ENOENT`):** If the tuple is not found in the `map_session_v4 / v6` table or it is not in `SESSION_GREETING` status, the session is not in the Pre-Authentication state. XDP ignores the request and does not emit an `AUTH_UN` packet.
-     * **First Login (`auth_ck_count == 1`):** If the tuple is present in `SESSION_GREETING` status, XDP atomically increments the value, validates the tuple, and responds via `XDP_TX` with `AUTH_UN`, confirming the limbo state.
-     * **Anomalous or Recurring Attempt (`auth_ck_count > 1`):** If the counter exceeds the first call for the same tuple, XDP interprets the event as an anomaly/replay attack, immediately deletes the record from `map_session_v4 / v6`, and breaks the loop without sending `AUTH_UN`, ensuring instant self-cleaning of the table.
+   * **Pre-Auth Binding and Replay Protection:** 
+     Replay protection and single-use handshake validation are fully offloaded to the User-Space Linear Probe table via Pop-On-Read and kernel-verified `Worker_PID` binding, eliminating the need for in-map state counters:
+     * **Tuple Missing or Active (`ENOENT` / `SESSION_ACTIVE`):** If the tuple is absent from `map_session_v4 / v6` or already promoted to `SESSION_ACTIVE`, XDP silently ignores the `AUTH_CK` request (`XDP_DROP`) without emitting an `AUTH_UN` packet.
+     * **Valid Handshake State (`SESSION_GREETING`):** If the tuple matches an active `SESSION_GREETING` state (`until_greet_when_ns < bpf_ktime_get_ns()`), XDP records the kernel-verified `Worker_PID` into the eBPF session record and responds via `XDP_TX` with an `AUTH_UN` packet to confirm the staging phase.
+     * **Replay Immunity (Pop-On-Read Enforcement):** Even if duplicate `AUTH_CK` or `AUTH_UN` control packets are replayed, state corruption is impossible. The Auth Verifier's atomic Pop-On-Read operation purges the Linear Probe slot upon the first `AUTH_OK` validation. Any subsequent promotion attempt matching the same `Worker_PID` fails instantly in User-Space without affecting active eBPF map states.
    * **Master Privilege Separation & Multi-Tier Blast Radius Isolation (OpenBSD Target Architecture):**
      * **Three-Level Architecture (Tiered Process Hierarchy):**
        * **Level 0 — Master Root Daemon (Privileged Key Custodian):** Holds root privileges, manages the primary process table via `waitpid()`, and is the only component authorized to generate and store TLS private keys in protected anonymous memory (`mmap` with `MAP_ANON | MAP_PRIVATE`, `madvise(MADV_DONTDUMP)`, and `mprotect`). It never manages network sockets or performs direct handshakes.
@@ -198,9 +199,8 @@ In the event of an anomaly or compromise within a Task Worker (Level 2), the sys
 * **Phase 2 — Hardening (Production OpenBSD Target):** Deployment of the 3-tiered hierarchy tailored to OpenBSD's security primitives, ensuring absolute privilege isolation and mitigation against side-channel attacks.
     * **Level 1 (Privilege Dropping):** Execution of `setresuid(_sec_master)` to strip root privileges immediately after binding to low-numbered network ports.
     * **Level 2 (Task Isolation):** Strict allocation of 1 PID per individual task to guarantee process boundaries and faults confinement.
-    * **Level 0 (Isolated Key Storage):** Secure memory management for cryptographic material utilizing `mmap` and `mprotect` for strict read/write access control, combined with `madvise(MADV_DONTDUMP)` and OpenBSD-specific `minherit(MAP_INHERIT_NONE)` to prevent secret leakage across memory dumps and `fork()` boundaries.
+    * **Level 0 (Isolated Key Storage):** Secure memory management for cryptographic material utilizing `mmap(..., MAP_CONCEAL)` to exclude sensitive pages from core dumps, `mprotect` for strict read/write access control, and `minherit(MAP_INHERIT_NONE)` to prevent secret leakage across `fork()` boundaries.
     * **Sandboxing Execution Order:** Final lock-down achieved by calling `unveil(NULL, NULL)` to completely strip file system visibility, followed by `pledge("stdio inet", NULL)` to restrict kernel subsystems. *Note: All memory protections and UID modifications are finalized prior to the pledge call to avoid runtime violations.*
-
 
 ---
 
@@ -230,37 +230,59 @@ Promoting a session to the high-performance state is contingent upon cryptograph
 
 The atomic promotion cycle progresses through three sequential phases:
 
-1. **Existence Probe (`AUTH_CK`):** 
-   Upon receiving an authentication request, the Auth Verifier Daemon holding the `(Client_IP, Client_Port)` tuple sends an `AUTH_CK` UDP packet to XDP to query the L4 connection state.
-
+1. **Existence Probe & Worker Binding (`AUTH_CK`):**
+   Upon receiving an authentication request via local IPC from a worker process, the Auth Verifier (AV) Daemon holding the `(Client_IP, Client_Port)` tuple queries the kernel via `getpeereid()` on the Unix Domain Socket (UDS) descriptor. This extracts the kernel-verified `Worker_PID`, completely bypassing self-reported credentials. The AV then transmits an `AUTH_CK` UDP packet containing `<Client_IP, Client_Port, Worker_PID>` over the dedicated control LAN to **BoxA:LAN** to query and bind the L4 connection state.
 2. **Hardware Confirmation and Pre-Auth Validation (`AUTH_UN` via `XDP_TX`):** 
-   * XDP intercepts `AUTH_CK` on the LAN side and verifies the tuple's presence in **`map_session_v4 / v6`** with status `SESSION_GREETING` and `until_greet_when_ns` < `bpf_ktime_get_ns()`.
-   * If present, it instantly responds to the Auth Verifier via `XDP_TX` with an `AUTH_UN` UDP packet.
-   * **Negative Outcome:** If the tuple does not exist in (e.g., connection absent or already expired), XDP does not emit `AUTH_UN`. The Auth Verifier marks the credentials as invalid regardless, halts processing without wasting CPU cycles, and logs the anomaly.
-
+   * XDP intercepts `AUTH_CK` on the LAN side and verifies the tuple's presence in **`map_session_v4 / v6`** with status `SESSION_GREETING` and `until_greet_when_ns < bpf_ktime_get_ns()`.
+   * If present, XDP records the `Worker_PID` into the eBPF session record and instantly responds to the Auth Verifier via `XDP_TX` with an `AUTH_UN` UDP packet.
+   * **Pre-Auth Staging (Linear Probe Allocation):** Upon receiving `AUTH_UN`, the AV records the kernel-verified `Worker_PID` alongside a cryptographically secure, negative Random Identifier (`RID < 0`, generated by the worker via `arc4random()` before the TLS Handshake stage) into an ultra-compact shared-memory Linear Probe table.
+   * **Negative Outcome:** If the tuple does not exist in eBPF (e.g., connection absent or already expired), XDP does not emit `AUTH_UN`. The Auth Verifier marks the credentials as invalid regardless, halts processing without wasting CPU cycles, and logs the anomaly.
 3. **Final Fast-Path Promotion (`AUTH_OK`):** 
-   Only following an `AUTH_UN` confirmation and subsequent application/TLS credential validation does the Auth Verifier Daemon transmit an `AUTH_OK` UDP packet toward the **BoxA:LAN** interface:
+   Following an `AUTH_UN` confirmation, completion of the TLS/mTLS handshake, and subsequent L7 credential validation, the worker issues a second IPC containing only the application credentials and the `RID`. The Auth Verifier executes an atomic Pop-On-Read lookup on the Linear Probe using the kernel-verified `Worker_PID`:
+   * **Pop-On-Read Validation:** The Auth Verifier extracts and immediately purges the slot matching `Worker_PID`. If the slot is empty or the `RID` fails to match, execution terminates immediately.
+   * **Token Sign Conversion (`RID < 0` $\rightarrow$ `UID > 0`):** Upon successful database validation, the Auth Verifier removes the negative `RID`, inserts the non-secret Username Identifier (where `UID` is a positive 32-bit integer), and transmits an `AUTH_OK` UDP packet containing `<Client_IP, Client_Port, SID, UID, Worker_PID>` (where `SID` stands for a random Session Identifier generated by the Auth Verifier) to **BoxA:LAN**, returning the `SID` to the worker as well.
    * **Silent Interception:** XDP intercepts the `AUTH_OK` packet and silently consumes it (`XDP_DROP`).
-   * **Atomic Promotion (`SESSION_ACTIVE`):** On Cache-Line 1 the `SESSION_GREETING` status is promoted to Fast-Path (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`). On the WAN side while XDP is in `SESSION_GREETING` on Cache-Line 0 when receives a valid TCP ACK it always looks for `SESSION_ACTIVE` on Cache-Line 1 to promote the status on its Cache-Line.
-  * **SYN Protection / DoS Mitigation (BoxA:WAN):** The presence of an unexpired tuple in `map_session_v4 / v6` enforces immediate SYN-Flood protection at the WAN interface. Any incoming `SYN` matching an active block (`until_when_ns == 0` or <i>t</i><sub>current</sub> &lt; <i>t</i><sub>until\_when\_ns</sub>) is dropped unconditionally (`XDP_DROP`) before state allocation or resource consumption can occur.
-  * **Established Session Interception:** Any ongoing session traffic (including `ACK`, `PSH`, or `FIN` in either direction) matching an unexpired `until_when_ns` timestamp is dropped instantly at Layer 0 (`XDP_DROP`), cutting off active streams without processing payload or updating session state.
-   * **Counter Update:** It atomically decrements (`__sync_fetch_and_sub`) the `pending_handshake_count` metric on **`map_pending_handshake`**.
+   * **Atomic Promotion (`SESSION_ACTIVE`):** On Cache-Line 1, the `SESSION_GREETING` status is promoted to Fast-Path (`SESSION_GREETING` $\rightarrow$ `SESSION_ACTIVE`). On the WAN side, while XDP is in `SESSION_GREETING` on Cache-Line 0, receiving a valid TCP ACK triggers a lookup for `SESSION_ACTIVE` on Cache-Line 1 to promote the status on Cache-Line 0.
+   * **SYN Protection / DoS Mitigation (BoxA:WAN):** The presence of an unexpired tuple in `map_session_v4 / v6` enforces immediate SYN-Flood protection at the WAN interface. Any incoming `SYN` matching an active block (`until_when_ns == 0` or `t_current < t_until_when_ns`) is dropped unconditionally (`XDP_DROP`) before state allocation or resource consumption can occur.
+   * **Established Session Interception:** Any ongoing session traffic (including `ACK`, `PSH`, or `FIN` in either direction) matching an unexpired `until_when_ns` timestamp is dropped instantly at Layer 0 (`XDP_DROP`), cutting off active streams without processing payload or updating session state.
+   * **Counter Update:** XDP atomically decrements (`__sync_fetch_and_sub`) the `pending_handshake_count` metric on **`map_pending_handshake`**.
    * **Line-Rate Forwarding:** From this moment forward, session traffic travels at line-rate on the Fast-Path WAN $\rightarrow$ LAN pipeline, protected by TCP window consistency checks.
 
 ---
 
-### 5.1. Fast-Path Specifications, UDP-Driven Teardown, and Race Condition Mitigation
+### 5.1. Memory Isolation, Process Lifecycle, and Linear Probe Architecture
+
+To uphold strict process isolation and guarantee zero memory leak in User-Space, the management of the staging state relies on OS-level process mechanics:
+
+1. **Kernel-Enforced Memory Isolation (`mmap` + OpenBSD `minherit`):**
+   * **Master Table Allocation:** At launch, the Master process allocates the shared-memory Linear Probe table via `mmap(..., MAP_SHARED | MAP_ANON, -1, 0)`.
+   * **Auth Verifier Binding:** The Master process forks the Auth Verifier (AV) process, which retains access to the shared region (`MAP_INHERIT_SHARE`) to perform atomic Pop-On-Read validations.
+   * **Inheritance Stripping (`minherit(2)`):** Immediately following the AV process initialization, the Master issues `minherit(ptr, size, MAP_INHERIT_NONE)` across the memory pages of the Linear Probe table, where `size` must be aligned to a multiple of the 4096-byte page size (`PAGE_SIZE`).
+   * **Flexible Worker Lifecycle:** The Master can then fork Worker processes initially and safely re-spawn crashed Worker instances dynamically at any point during system execution.
+
+   **Security Result:** The OpenBSD kernel explicitly strips the Linear Probe memory pages from the virtual address space (`p_vmspace`) of any subsequently spawned Worker process. This guarantees **Zero-Time Exposure**: even if a Worker is compromised or inspects its own memory mappings, the Linear Probe table is completely unmapped, rendering unauthorized inspection, memory dumps, or corruption mathematically impossible while removing rigid process initialization constraints.
+2. **Ultra-Compact Slot Layout (64-bit):** Each slot in the Linear Probe table occupies exactly 8 bytes (64 bits): `<Worker_PID: int32_t, UID: int32_t>`.
+3. **Array Sizing and Load Factor ($\alpha \le 0.5$):**
+   To guarantee true $O(1)$ lookup and deletion without collision clustering, the table is pre-allocated at launch:
+   * **Table Size = $2 \times \text{MAX\_WORKERS}$**
+   * **For 10,000 concurrent workers, the table requires only 160 KB, residing continuously inside CPU L2/L3 cache lines.**
+4. **Deterministic $O(1)$ Garbage Collection via Master (`SIGCHLD`):**
+   If a worker process crashes or is terminated (e.g., via OpenBSD `pledge` sandboxing violation) during the TLS handshake:
+   * **The OpenBSD kernel delivers a `SIGCHLD` signal to the Master process.**
+   * **The Master invokes `waitpid()` to retrieve the `dead_pid`.**
+   * **Using `dead_pid`, the Master accesses the exact slot index in the Linear Probe and performs an atomic 64-bit zeroing in nanoseconds.**
+   * **On Box A, XDP allows the unpromoted `SESSION_GREETING` entry to decay naturally upon expiration of `until_greet_when_ns`, requiring zero control-plane UDP chatter.**
+
+---
+
+### 5.2. Fast-Path Specifications, UDP-Driven Teardown, and Race Condition Mitigation
 
 * **Rate-Limiting Exemption for Authenticated Clients:** Clients present in `map_session` travel at full line-rate without undergoing frequency checks or token counting, ensuring maximum throughput.
 * **In-Window Validation on XDP (RFC 793):** Every incoming data/ACK packet must comply with the TCP window acceptability rule:
 
-  <div align="center">
- 
-    \$`SEG.SEQ \ge \text{Expected} \quad \text{AND} \quad SEG.SEQ < \text{Expected} + \mathrm{Window\_Size}`\$
+$$SEG.SEQ \ge \text{Expected} \quad \text{AND} \quad SEG.SEQ < \text{Expected} + \text{Window\_Size}$$
 
-  </div>
-  
-    Packets falling outside this range are dropped at ingress (`XDP_DROP`), protecting OpenBSD from out-of-window ACK Flood attacks.
+  Packets falling outside this range are dropped at ingress (`XDP_DROP`), protecting OpenBSD from out-of-window ACK Flood attacks.
 * **Resilience to Blind Sequence Attacks:** If an attacker sends packets with randomized sequence numbers spoofing an active client, XDP drops them on the first CPU cycle. The client's entry in `map_session` **remains unaltered and unpurged**, safeguarding legitimate connections from forced disconnections.
 * **Resilience to Slowloris Attacks and Sandbox Isolation:** 
   * **TLS Failure Tarpit (AI Security Gateway):** If the TLS/mTLS negotiation fails prior to authentication, the AI Security Gateway closes the socket by issuing a `TCP RST`. XDP on **BoxA:LAN** intercepts the `TCP RST`, purges the session from `map_session_v4 / v6`, decrements `pending_handshake_count`, and due to the `SESSION_GREETING` status, executes a **silent `XDP_DROP` of the `TCP RST`** toward the peer. The attacker remains stalled waiting for a timeout (Tarpit), while OpenBSD and Box A have already cleared their local state.
@@ -277,11 +299,11 @@ The atomic promotion cycle progresses through three sequential phases:
 
 ---
 
-### 5.2. Sanctions and Immediate Termination (`TEARDOWN`)
+### 5.3. Sanctions and Immediate Termination (`TEARDOWN`)
 
 Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or policy enforcement):
 1. XDP extracts the target tuple `(Client_IP, Client_Port)` from the control payload.
-2. It performs an atomic lookup/update on **`map_session_v4 / v6`** to transition the session state to blacklisted by setting `until_when_ns` (**`map_ip_trespass`** if the host is a repeat offender or <i>t</i><sub>current</sub> + <i>t</i><sub>duration\_ns</sub> for timed eviction).
+2. It performs an atomic lookup/update on **`map_session_v4 / v6`** to transition the session state to blacklisted by setting `until_when_ns` (**`map_ip_trespass`** if the host is a repeat offender or `t_current + t_duration_ns` for timed eviction).
 3. **Atomic State & Counter Management (Single Source of Truth):**
    * **If session is active/pending:** XDP updates `until_when_ns` to enforce immediate bidirectional dropping (`XDP_DROP`). If the session was still in the handshake phase, it atomically decrements `pending_handshake_count` on **`map_pending_handshake`**.
    * **If entry is already blacklisted or absent:** If `until_when_ns` is already active or the entry was previously cleaned up, XDP aborts execution without modifying global counters, mathematically eliminating any risk of a *double-decrement*.
