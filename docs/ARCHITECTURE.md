@@ -20,8 +20,12 @@
 <a id="1-initial-packet-inspection"></a>
 ## 1. Initial Inspection, Dynamic Handshake Throttling and SYN Forwarding (BoxA:WAN)
 
-On the external interface **BoxA:WAN**, in addition to the usual header field validation check, blacklist verification and rate limiting are performed exclusively on SYN packets, passing through a pipeline before any stateful processing:
+On the external interface **BoxA:WAN**, in addition to standard header field validation, all incoming network traffic passes through an early-stage pipeline before any stateful processing:
 
+* **Immutable Target Filtering via `.rodata` Static Constants (Cycle 0 Ingress Guard):**
+  * **Early Drop Execution:** Local target IP addresses (`cfg_target_ip`) and allowed destination ports (`cfg_target_port`) are loaded as read-only kernel constants (`.rodata`) at eBPF initialization.
+  * **Pre-Lookup Scuttling:** All incoming packets (whether `SYN`, `ACK`, `RST`, or arbitrary non-SYN floods) targeting unauthorized ports or unmapped IP destinations are dropped (`XDP_DROP`) immediately at the NIC driver layer prior to performing any hash-map lookup (`bpf_map_lookup_elem`).
+  * **DoS, Port Scan & PF Offload Resiliency:** Eliminates memory allocation overhead, map lock contention, and CPU cache pollution from port scanners or volumetric noise, completely shielding OpenBSD's Packet Filter (PF) from processing unmapped traffic.
 * **RTBH / FIB Reverse Lookup (Zero Maps):** XDP performs a Reverse Route Lookup via the helper function `bpf_fib_lookup()`, checking the route for the packet's source IP. If the source IP falls within a prefix advertised via BGP as `blackhole` or `unreachable`, the packet is instantly dropped (`XDP_DROP`).
 * **Volumetric SYN-Flood Mitigation (`map_cpu_syn_stats`):** To shield the OpenBSD Gateway (**Box B**) from state-table saturation under volumetric L4 SYN-floods, **Box A** executes an early-stage probabilistic **Per-CPU Lockless Filter** at **Cycle 0** (XDP driver layer).
   * **Zero-Contention Design:** Eliminates cross-CPU lock contention and cache invalidation by operating on isolated `BPF_MAP_TYPE_PERCPU_ARRAY` maps. Each CPU core evaluates its local clock delta <i>&Delta;t</i> = <i>t</i><sub>current</sub> - <i>t</i><sub>last\_seen</sub> without atomic operations.
@@ -60,6 +64,7 @@ Upon receiving the SYN-ACK packet issued by OpenBSD (BoxB) to the client:
   * **Expected Sequence Number:** $Seq_{SYN-ACK} + 1$
   * **TCP Initial Window Size:** Window size declared by OpenBSD.
   * **Creation Timestamp (`created_at_ns`):** Generated via `bpf_ktime_get_ns()` to calculate the handshake timeout (e.g. 3-5 seconds).
+  * **IP service port:** IP port where the service is listening.
 * **Pending Handshake Counter Increment:** XDP atomically increments (`__sync_fetch_and_add`) the `pending_handshake_count` value and updates `last_syn_ack_ns` in the `map_mitigation_v4 / v6` map for the client IP, triggering dynamic throttling for subsequent SYNs from the same IP.
 
 ---
@@ -69,17 +74,19 @@ Upon receiving the SYN-ACK packet issued by OpenBSD (BoxB) to the client:
 
 Session management begins on the **BoxA:WAN** interface with handshake validation and continues, in the event of failure or cleanup, with interception of return traffic on the **BoxA:LAN** interface:
 
-1. **TCP Header Check, Cascade Lookup, and Handshake Promotion (BoxA:WAN):** Before inspecting **`map_handshake_v4 / v6`**, XDP verifies the TCP ACK flag (ensuring SYN is clear). The packet checks **`map_session_v4 /v6`** first to protect active flows.
-   * If missing from the table, XDP checks the payload length and if it doesn't contains an empty 0-byte data payload, it is dropped immediately (`XDP_DROP`) without querying **`map_handshake_v4 / v6`**, otherwise if the packet contains an empty 0-byte data payload, **`map_handshake_v4 / v6`** is queried. If the sequence number matches perfectly  $Seq_{SYN-ACK} + 1$:
-     * The (IP, Port) tuple is not promoted directly to the Fast-Path, but inserted into the limbo (through the `SESSION_GREETING` status active on both cache lines) **through the creation of a new record into BPF Map `map_session_v4 / v6`** (structured as a Dual Cache Line to separate WAN read data from LAN window changes) with also the greeting timeout: `until_greet_when_ns` = `bpf_ktime_get_ns()` + $T_{timeout}$ and the copy of `seq_expected` and `window_size` already present in **`map_handshake_v4 / v6`**.
+1. **Cycle 0 Static Ingress Guard (`.rodata` Destination Check):** Before executing any stateful operation or BPF map lookup (`map_session`, `map_handshake`), XDP performs an immediate, zero-cost Cycle 0 evaluation against read-only constants (`cfg_target_ip`, `cfg_target_port`) loaded into eBPF `.rodata`. Any incoming packet (whether `SYN`, `ACK`, `RST`, `PSH`, or arbitrary non-SYN flood) that does not match the local target destination IP and port is immediately dropped or bypassed (`XDP_DROP` / `XDP_PASS`) directly at the network driver layer. This eliminates BPF map lookup overhead, CPU register allocation, and cache-miss penalty under high-volumetric non-SYN packet floods.
+
+2. **TCP Header Check, Cascade Lookup, and Handshake Promotion (BoxA:WAN):** Before inspecting **`map_handshake_v4 / v6`** and after passing the Cycle 0 `.rodata` destination check, XDP verifies the TCP ACK flag (ensuring SYN is clear). The packet checks **`map_session_v4 / v6`** first to protect active flows.
+   * If missing from the table, XDP checks the payload length and if it doesn't contain an empty 0-byte data payload, it is dropped immediately (`XDP_DROP`) without querying **`map_handshake_v4 / v6`**, otherwise if the packet contains an empty 0-byte data payload, **`map_handshake_v4 / v6`** is queried. If the sequence number matches perfectly  $Seq_{SYN-ACK} + 1$:
+     * The (IP, Port) tuple is not promoted directly to the Fast-Path, but inserted into the limbo (through the `SESSION_GREETING` status active on both cache lines) **through the creation of a new record into BPF Map `map_session_v4 / v6`** (structured as a Dual Cache Line to separate WAN read data from LAN window changes) with also the greeting timeout: `until_greet_when_ns` = `bpf_ktime_get_ns()` + $T_{timeout}$ and the copy of `seq_expected`,`window_size` and `ip_dstport` already present in **`map_handshake_v4 / v6`** with the involved fields that must meet the checks.
      * The entry is removed from **`map_handshake_v4 / v6`** and the packet is forwarded to the AI Security Gateway via `XDP_REDIRECT`.
    * Implicit Drop: Any non-SYN packet failing all map lookups and prerequisites is dropped instantly (`XDP_DROP`).
 
-2. **In-Window Validation and Rate-Limiting Pre-Auth (BoxA:WAN):** Packets belonging the status `SESSION_GREETING` travel under strict rate-limiting and in-window checking. Simultaneously, the AI Security Gateway queries the native connection via kernel syscalls (`getpeername()` / `.peer_addr()`) to extract the exact `(IP, Port)` tuple guaranteed by the operating system and send it to the corresponding Auth Verifier Daemon before starting the TLS handshake process.
+3. **In-Window Validation and Rate-Limiting Pre-Auth (BoxA:WAN):** Packets belonging the status `SESSION_GREETING` travel under strict rate-limiting and in-window checking. Simultaneously, the AI Security Gateway queries the native connection via kernel syscalls (`getpeername()` / `.peer_addr()`) to extract the exact `(IP, Port)` tuple guaranteed by the operating system and send it to the corresponding Auth Verifier Daemon before starting the TLS handshake process.
 
-3. **SYN Protection / DoS Mitigation:** As explained at section 1 the existence of the tuple  in **`map_session_v4 /v6`** immediately involve the dropping of any additional or duplicate `SYN` packets coming from the same source IP and port, protecting the OpenBSD operative system from reconnection attempts or SYN-Floods.
+4. **SYN Protection / DoS Mitigation:** As explained at section 1 the existence of the tuple  in **`map_session_v4 /v6`** immediately involve the dropping of any additional or duplicate `SYN` packets coming from the same source IP and port, protecting the OpenBSD operative system from reconnection attempts or SYN-Floods.
    
-4. **Hardened Anchor and Existence Probe (`AUTH_CK` / `AUTH_UN`) (BoxA:LAN):**
+5. **Hardened Anchor and Existence Probe (`AUTH_CK` / `AUTH_UN`) (BoxA:LAN):**
    * Before processing or attempting to verify any credentials (username/password/mTLS), the Auth Verifier Daemon sends a UDP `AUTH_CK` packet to XDP specifying the tuple extracted from the socket, to ensure that a regular Pre-Authentication (`SESSION_GREETING`) phase is actually in progress for that tuple, confirmed by the presence of the record and the receipt of `AUTH_UN`.
    * **Out-of-Band Communication and Stateless Nature (UDP Only):** The Auth Verifier operates exclusively on an asynchronous UDP channel in completely *stateless* mode. It does not retain session state in memory: once the single verification is complete, it instantly frees all local resources.
    * **Pre-Auth Binding and Replay Protection:** 
@@ -108,7 +115,7 @@ Session management begins on the **BoxA:WAN** interface with handshake validatio
    * **Enumeration & Brute-Force Inhibition (Failure to Detect `AUTH_UN` as an Attack Indicator):** If the `AUTH_UN` packet is not received following the `AUTH_CK` probe, the Auth Verifier classifies the event as an **ongoing attack or network anomaly**. The daemon immediately stops all processing without accessing the application database and without storing contexts. The `(IP, Port)` tuple is deterministically discarded at the network level by XDP.
    * *Note on Architectural Maturity:* At the current stage (MVP/Base), attack isolation occurs exclusively at the stateless network and process levels (Zero-DB). Updating the risk status to the Database (with policy persistence and garbage collection) is planned as a future evolution of the infrastructure.
 
-5. **Incomplete TLS Handling / mTLS Failure (BoxA:LAN and TLS Tarpit):**
+6. **Incomplete TLS Handling / mTLS Failure (BoxA:LAN and TLS Tarpit):**
    * Upon negotiation failure in step 3 (or due to invalid TLS/mTLS), the native OpenBSD stack closes the socket and issues a `TCP RST` (via `SO_LINGER(0)`).
    * XDP intercepts the `TCP RST` on the **BoxA:LAN** interface, extracts the `(IP, Port)` tuple, and performs atomic sanitization:
      1. Deletes the `(IP, Port)` tuple from **`map_session_v4 / v6`** in status `SESSION_GREETING` via `bpf_map_delete_elem()`.
@@ -226,7 +233,7 @@ To reduce the window of potential abuse to the absolute theoretical minimum:
 <a id="5-fast-path"></a>
 ## 5. Synchronous Fast-Path Promotion (`map_session`) via `AUTH_CK` / `AUTH_UN` / `AUTH_OK` Cycle
 
-Promoting a session to the high-performance state is contingent upon cryptographic/application-layer validation and the completion of a bidirectional handshake cycle. All network traffic that does **not** belong to the TCP 3-Way Handshake or the initial authentication phase must find an active match in the **`map_session_v4 / v6`** map; otherwise, the packet is immediately dropped (`XDP_DROP`).
+Promoting a session to the high-performance state is contingent upon cryptographic/application-layer validation and the completion of a bidirectional handshake cycle. At Ingress (**Cycle 0**), all incoming network traffic is strictly validated against read-only `.rodata` constants (`cfg_target_ip`, `cfg_target_port`) before executing any BPF map lookups. All network traffic that does **not** match active records in **`map_session_v4 / v6`** or pass early TCP handshake validation is immediately dropped (`XDP_DROP`), preserving CPU cache lines and preventing lookup overhead during volumetric non-SYN traffic floods.
 
 The atomic promotion cycle progresses through three sequential phases:
 
@@ -321,6 +328,13 @@ Upon receiving a `TEARDOWN` UDP packet (credential failure, L7 anomalies, or pol
 | **`map_net_whitelist_dc`** | `BPF_MAP_TYPE_LPM_TRIE` | Data center network address and CIDR map. | Updated via User Space program. |
 | **`map_mitigation`** | `BPF_MAP_TYPE_LRU_HASH` | `Client_IP` → `struct mitigation_value` | Unified IP tracking for transient trespass escalation, token-bucket SYN rate-limiting, and pending handshakes. Enforces dynamic local bans to bridge traffic until upstream RTBH propagation takes effect. |
 | **`map_cpu_syn_stats`** | `BPF_MAP_TYPE_PERCPU_ARRAY` | `u32 (Index)` → `struct syn_stats` | Low-latency per-CPU array providing instant local metrics for volumetric SYN DDoS drop at Cycle 0 without cross-CPU lock contention or cache invalidation. |
+
+---
+
+### 6.1. Session Map Memory Layout & Optimization (`map_session_v4 / v6`)
+* **Cache Line 1 Hot-Path Alignment:** The session entry structure packs critical validation metadata into the first 64-byte boundary to guarantee single-line CPU cache fetch during XDP execution.
+* **Explicit Destination Port Tracking (`ip_dstport`):** Stores the targeted destination port alongside the TCP `window_size`. This binds the staging state strictly to the intended destination service, preventing cross-port hijacking or unauthorized session inheritance across local endpoints.
+* **Multi-Attribute Staging Verification:** During packet processing, the fast-path matches the 5-tuple, `ip_dstport`, and `window_size` in unison before considering any state transition valid.
 
 ---
 
@@ -460,6 +474,9 @@ flowchart TD
   * **Incomplete TLS Shutdown:** Handled silently by the **TLS Tarpit** mechanism via `XDP_DROP` of the `TCP RST` induced by `SO_LINGER(0)`.
   * **Explicit Promotion or Penalty:** Synchronized with XDP via control UDP packets intercepted and consumed at Cycle 0, keeping BPF maps clean and immune to internal injection.
 * **Targeted DoS and Hijacking Resistance:** Exempting successfully authenticated flows from aggressive rate-limiting checks—combined with strict TCP window validation (RFC 793)—guarantees maximum throughput for legitimate clients while ensuring complete immunity to de-authentication attempts via spoofed garbage packets.
+* **Peripheral Routing and Whitelist Integrity Guarantee:**
+  * **PF Offload & Flooding Prevention:** Scuttling non-whitelisted or unexpected traffic at Cycle 0 on Box A prevents packet floods from reaching OpenBSD's Packet Filter (PF) state table and network stack, preserving CPU and memory resources on Box B.
+  * **Cross-Port Isolation:** Even if a packet matches a valid active source tuple, an altered destination port invalidates the fast-path check, making remote bypass of the Whitelist mathematically impossible.
 
 ---
 
@@ -497,4 +514,4 @@ For commercial licensing, enterprise deployment rights, proprietary integrations
 
 ---
 
-*Extended security modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).* modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).**
+*Extended security modeling, technical documentation formatting, and diagram layout refined in collaboration with **Gemini** (Google AI Systems).*
